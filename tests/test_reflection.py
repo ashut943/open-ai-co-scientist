@@ -90,6 +90,37 @@ def test_reflection_error_returns_not_reviewed_rich_defaults():
     assert review["review_scores"] == {k: 0 for k in REVIEW_SCORE_KEYS}
     assert review["critical_assumptions"] == []
     assert review["references"] == []
+    assert review["error"] == "Error: API call failed"
+
+
+def test_reflection_unparsable_output_is_an_error_not_medium():
+    with patch("app.agents.call_llm", return_value="I think it's pretty good."):
+        review = call_llm_for_reflection("hypothesis text")
+
+    assert review["error"].startswith("Could not parse LLM response")
+    assert review["novelty_review"] == "Not reviewed"
+    assert review["review_scores"] == {k: 0 for k in REVIEW_SCORE_KEYS}
+
+
+def test_reflection_agent_reports_failure_and_keeps_prior_review():
+    goal = ResearchGoal(description="Goal")
+    context = ContextMemory()
+    reviewed = Hypothesis("G1", "Reviewed", "body one")
+    reviewed.review_scores = {"novelty": 4}
+    reviewed.novelty_review = "HIGH"
+    fresh = Hypothesis("G2", "Fresh", "body two")
+    context.add_hypothesis(reviewed)
+    context.add_hypothesis(fresh)
+
+    with patch("app.agents.call_llm", return_value="Error: Rate limit exceeded: slow down"):
+        errors = ReflectionAgent().review_hypotheses([reviewed, fresh], context, goal)
+
+    assert len(errors) == 1
+    assert "G1" in errors[0] and "G2" in errors[0]
+    assert "Rate limit exceeded" in errors[0]
+    assert reviewed.review_scores == {"novelty": 4}
+    assert reviewed.novelty_review == "HIGH"
+    assert fresh.novelty_review == "Not reviewed"
 
 
 def test_reflection_agent_populates_hypothesis_fields():
@@ -99,8 +130,9 @@ def test_reflection_agent_populates_hypothesis_fields():
     context.add_hypothesis(hypo)
 
     with patch("app.agents.call_llm", return_value=_rich_payload()):
-        ReflectionAgent().review_hypotheses([hypo], context, goal)
+        errors = ReflectionAgent().review_hypotheses([hypo], context, goal)
 
+    assert errors == []
     assert hypo.novelty_review == "HIGH"
     assert hypo.feasibility_review == "LOW"
     assert hypo.review_scores["scientific_soundness"] == 4

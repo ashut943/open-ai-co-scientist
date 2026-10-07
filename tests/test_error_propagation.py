@@ -2,6 +2,7 @@
 ranking (issue llnl#36). Offline: the LLM boundary is mocked at app.agents.call_llm.
 """
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -88,13 +89,69 @@ def test_run_cycle_propagates_generation_error(llm_error, expected_category):
     assert expected_category in {classify_llm_error(e) for e in details["errors"]}
 
 
+_REVIEW = json.dumps({"review_scores": {"novelty": 4, "feasibility": 3}, "comment": "ok", "references": []})
+_JUDGMENT = json.dumps({"winner": "A", "confidence": 0.8, "reasoning": "A", "criterion_scores": {}})
+_META = json.dumps({"recommended_evolution_strategy": [{"operator": "REFINE", "parent_ids": []}]})
+_CHILD = json.dumps({"title": "Child", "text": "evolved", "reasoning": "r"})
+_GENERATED = '[{"title": "H1", "text": "idea one"}, {"title": "H2", "text": "idea two"}]'
+
+
+def _step_llm(**failing):
+    """Fake LLM answering each step by its prompt; `failing` maps a step name
+    (reflection/judge/meta/evolution) to the error string that step returns."""
+
+    def fake(prompt, temperature=0.7, model=None):
+        if "Score the hypothesis" in prompt:
+            return failing.get("reflection", _REVIEW)
+        if "tournament judge" in prompt:
+            return failing.get("judge", _JUDGMENT)
+        if "conducting a meta-review" in prompt:
+            return failing.get("meta", _META)
+        if "Evolution operator:" in prompt:
+            return failing.get("evolution", _CHILD)
+        return _GENERATED
+
+    return fake
+
+
+def _run_cycle(fake_llm):
+    with (
+        patch("app.agents.call_llm", side_effect=fake_llm),
+        patch(
+            "app.agents.ProximityAgent.build_proximity_graph",
+            return_value={"adjacency_graph": {}, "nodes": [], "edges": []},
+        ),
+    ):
+        return SupervisorAgent().run_cycle(_goal(), ContextMemory())
+
+
 def test_run_cycle_no_errors_key_on_success():
-    payload = '[{"title": "H1", "text": "idea one"}]'
-    with patch("app.agents.call_llm", return_value=payload):
-        details = SupervisorAgent().run_cycle(_goal(), ContextMemory())
+    details = _run_cycle(_step_llm())
 
     assert "errors" not in details or not details["errors"]
     assert details["steps"]["generation"]["hypotheses"]
+
+
+@pytest.mark.parametrize(
+    "step, marker",
+    [
+        ("reflection", "Reflection review failed"),
+        ("judge", "Tournament judge failed"),
+        ("meta", "Meta-review failed"),
+        ("evolution", "evolution of"),
+    ],
+)
+def test_run_cycle_surfaces_failures_after_generation(step, marker):
+    """A failing later step must reach cycle_details["errors"] even though the
+    cycle keeps going with a fallback, so the UI cannot report plain success."""
+    llm_error = "Error: Rate limit exceeded: too many requests"
+    details = _run_cycle(_step_llm(**{step: llm_error}))
+
+    assert details["steps"]["generation"]["hypotheses"]
+    assert details.get("errors"), f"{step} failure was not surfaced"
+    matching = [e for e in details["errors"] if marker in e]
+    assert matching, details["errors"]
+    assert classify_llm_error(matching[0]) == "Rate limited by the model provider"
 
 
 def test_surfaced_error_never_contains_key(monkeypatch):

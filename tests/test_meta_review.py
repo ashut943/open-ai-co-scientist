@@ -84,6 +84,18 @@ def test_meta_review_falls_back_on_llm_error():
 
     assert meta["recommended_evolution_strategy"]
     assert any(item.get("operator") == "HYBRIDIZE" for item in meta["recommended_evolution_strategy"])
+    assert meta["fallback_reason"] == "Error: API call failed"
+
+
+def test_meta_review_success_has_no_fallback_reason():
+    goal = ResearchGoal(description="Goal")
+    context = ContextMemory()
+    context.add_hypothesis(_hypo("G1", "A", "text a"))
+
+    with patch("app.agents.call_llm", return_value=_meta_payload()):
+        meta = call_llm_for_meta_review(goal, context)
+
+    assert "fallback_reason" not in meta
 
 
 def test_evolution_uses_meta_review_strategy():
@@ -107,7 +119,7 @@ def test_evolution_uses_meta_review_strategy():
         "app.agents.call_llm",
         return_value=json.dumps({"title": "Child", "text": "Body", "reasoning": "ok"}),
     ) as mock_call:
-        children = EvolutionAgent().evolve_hypotheses(context, goal)
+        children, _ = EvolutionAgent().evolve_hypotheses(context, goal)
 
     assert len(children) == 2
     assert {c.evolution_operator for c in children} == {"MUTATE", "HYBRIDIZE"}

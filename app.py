@@ -437,8 +437,8 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
 
     html = f"<h2>🔬 Iteration {cycle_details.get('iteration', 'Unknown')}</h2>"
 
-    # Surface generation errors up front with an actionable category, so a failed
-    # run explains itself instead of silently showing empty rankings (issue llnl#36).
+    # Surface step errors up front with an actionable category, so a failed or
+    # degraded run explains itself instead of looking successful (issue llnl#36).
     errors = cycle_details.get("errors", [])
     if errors:
         items = ""
@@ -447,8 +447,8 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
             items += f"<li><strong>{html_lib.escape(category)}:</strong> {html_lib.escape(str(e))}</li>"
         html += f"""
         <div style="margin: 20px 0; padding: 15px; border: 2px solid #e74c3c; border-radius: 8px; background-color: #fff5f5;">
-            <h3>⚠️ Generation could not complete</h3>
-            <p>The model/API reported the following, so some or all hypotheses were not generated:</p>
+            <h3>⚠️ Some steps did not complete</h3>
+            <p>The model/API reported the following. Affected steps were skipped or used a fallback, so the results below may be incomplete:</p>
             <ul style="color: #c0392b;">{items}</ul>
         </div>
         """
@@ -578,6 +578,11 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
                 meta_review = step_data
             assert "meta_review_critique" in meta_review, f"meta_review_critique missing in meta_review: {meta_review}"
             assert "research_overview" in meta_review, f"research_overview missing in meta_review: {meta_review}"
+            if meta_review.get("fallback_reason"):
+                html += (
+                    '<p style="color: #c0392b;"><strong>⚠️ The LLM meta-review failed; '
+                    "this is a rule-based summary built from the reviews instead.</strong></p>"
+                )
             if meta_review.get("meta_review_critique"):
                 html += "<h5>Critique:</h5><ul>"
                 for critique in meta_review["meta_review_critique"]:

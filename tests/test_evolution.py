@@ -121,8 +121,13 @@ def test_evolve_hypothesis_returns_none_on_llm_error():
     parent = _hypo("G1", "Parent", "Text")
     context.add_hypothesis(parent)
 
+    errors: list[str] = []
     with patch("app.agents.call_llm", return_value="Error: API call failed"):
-        assert evolve_hypothesis("SIMPLIFY", [parent], goal, context) is None
+        assert evolve_hypothesis("SIMPLIFY", [parent], goal, context, errors=errors) is None
+
+    assert len(errors) == 1
+    assert "SIMPLIFY" in errors[0] and "G1" in errors[0]
+    assert "Error: API call failed" in errors[0]
 
 
 def test_evolution_agent_runs_all_operators_and_preserves_lineage():
@@ -151,8 +156,9 @@ def test_evolution_agent_runs_all_operators_and_preserves_lineage():
         )
 
     with patch("app.agents.call_llm", side_effect=fake_llm):
-        children = EvolutionAgent().evolve_hypotheses(context, goal)
+        children, errors = EvolutionAgent().evolve_hypotheses(context, goal)
 
+    assert errors == []
     assert len(children) == 4
     ops = {c.evolution_operator for c in children}
     assert ops == {"REFINE", "MUTATE", "SIMPLIFY", "HYBRIDIZE"}
@@ -176,7 +182,7 @@ def test_evolution_agent_skips_hybridize_with_single_hypothesis():
         "app.agents.call_llm",
         return_value=json.dumps({"title": "Child", "text": "Body", "reasoning": "ok"}),
     ):
-        children = EvolutionAgent().evolve_hypotheses(context, goal)
+        children, _ = EvolutionAgent().evolve_hypotheses(context, goal)
 
     assert len(children) == 3
     assert all(c.evolution_operator != "HYBRIDIZE" for c in children)

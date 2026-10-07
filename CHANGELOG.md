@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Failures after generation are no longer silent. If a reflection review,
+  tournament judgment, meta-review, or evolution operator fails, the cause is
+  added to `cycle_details["errors"]` and shown in the results error box and
+  status line, while the cycle continues with its fallback. A failed review
+  no longer invents MEDIUM ratings or overwrites an earlier successful review,
+  and the meta-review section is marked when it is a rule-based fallback.
 - Tournaments no longer judge every pair: each hypothesis plays about
   `tournament_matches_per_hypothesis` (default 3) LLM-judged matches, so judge
   calls grow linearly instead of as n*(n-1)/2 (set 0 for a full round-robin).
