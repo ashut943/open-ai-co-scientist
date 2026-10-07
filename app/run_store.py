@@ -81,6 +81,7 @@ def research_goal_to_dict(research_goal: Any) -> Dict[str, Any]:
             "reflection_temperature": getattr(research_goal, "reflection_temperature", None),
             "elo_k_factor": getattr(research_goal, "elo_k_factor", None),
             "top_k_hypotheses": getattr(research_goal, "top_k_hypotheses", None),
+            "user_references": getattr(research_goal, "user_references", []),
         }
     )
 
@@ -310,6 +311,8 @@ def _hypothesis_block(index: int, hypothesis: Dict[str, Any]) -> str:
         ("Falsification conditions", "falsification_conditions"),
         ("Safety / ethics", "safety_ethical_concerns"),
         ("Recommended improvements", "recommended_improvements"),
+        ("Closest prior work", "closest_prior_work"),
+        ("References", "references"),
     ):
         values = hypothesis.get(key) or []
         if values:

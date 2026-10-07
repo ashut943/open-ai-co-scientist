@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 from app.agents import ReflectionAgent, call_llm_for_reflection
 from app.models import REVIEW_SCORE_KEYS, ContextMemory, Hypothesis, ResearchGoal
+from app.tools import literature as lit
+from app.utils import classify_llm_error
 
 
 def _rich_payload(**overrides):
@@ -140,5 +142,71 @@ def test_reflection_agent_populates_hypothesis_fields():
     assert hypo.falsification_conditions
     assert hypo.safety_ethical_concerns == ["Lead-containing precursors"]
     assert hypo.recommended_improvements == ["Specify encapsulation strategy"]
-    assert hypo.references == ["2301.12345"]
+    # No literature was retrieved, so the bare arXiv ID cannot be verified.
+    assert hypo.references == []
+    assert any("Dropped 1 cited reference" in c for c in hypo.review_comments)
     assert any("Promising but feasibility" in c for c in hypo.review_comments)
+
+
+class _FakeLiterature:
+    def __init__(self, papers, errors=()):
+        self.papers, self.errors, self.queries = papers, list(errors), []
+
+    def search(self, query):
+        self.queries.append(query)
+        return list(self.papers), list(self.errors)
+
+
+def test_reflection_prompt_includes_literature_and_user_references():
+    paper = lit._paper("openalex", "W1", "Perovskite tandems at scale", "We demonstrate tandems.", 2023)
+    user_refs = [{"label": "U1", "kind": "note", "text": "Pilot showed a 3% gain", "raw": "x"}]
+
+    with patch("app.agents.call_llm", return_value=_rich_payload()) as mock_call:
+        call_llm_for_reflection("hypothesis text", literature=[paper], user_references=user_refs)
+
+    prompt = mock_call.call_args.args[0]
+    assert "[P1]" in prompt and "Perovskite tandems at scale" in prompt
+    assert "[U1] Note from the user: Pilot showed a 3% gain" in prompt
+    assert "closest_prior_work" in prompt
+
+
+def test_reflection_agent_grounds_review_in_literature_and_user_references():
+    goal = ResearchGoal(description="Real research goal")
+    goal.resolved_references = [{"label": "U1", "kind": "note", "text": "Pilot showed a 3% gain", "raw": "x"}]
+    context = ContextMemory()
+    hypo = Hypothesis("G1", "Perovskite silicon tandem stability", "Hypothesis body")
+    context.add_hypothesis(hypo)
+    paper = lit._paper(
+        "openalex", "W1", "Perovskite tandems at scale", "Abstract.", 2023, "Nature", ["A. Smith"], "10.1000/tandem"
+    )
+    searcher = _FakeLiterature([paper])
+    payload = _rich_payload(
+        references=["P1", "U1", "Invented et al. (2020)"],
+        closest_prior_work=["P1: same tandem architecture"],
+    )
+
+    with patch("app.agents.call_llm", return_value=payload):
+        errors = ReflectionAgent(literature=searcher).review_hypotheses([hypo], context, goal)
+
+    assert errors == []
+    assert searcher.queries == ["Perovskite silicon tandem stability"]
+    assert hypo.closest_prior_work == ["P1: same tandem architecture"]
+    assert hypo.literature[0]["doi"] == "10.1000/tandem"
+    assert hypo.references == [lit.citation(paper), "Note: Pilot showed a 3% gain"]
+    assert any("Dropped 1 cited reference" in c for c in hypo.review_comments)
+
+
+def test_reflection_agent_surfaces_literature_failures_once_per_cause():
+    goal = ResearchGoal(description="Goal")
+    context = ContextMemory()
+    hypos = [Hypothesis("G1", "One", "body"), Hypothesis("G2", "Two", "body")]
+    for h in hypos:
+        context.add_hypothesis(h)
+    searcher = _FakeLiterature([], errors=["Literature search (openalex) failed: boom"])
+
+    with patch("app.agents.call_llm", return_value=_rich_payload()):
+        errors = ReflectionAgent(literature=searcher).review_hypotheses(hypos, context, goal)
+
+    assert errors == ["Literature search (openalex) failed: boom (2 searches)"]
+    assert classify_llm_error(errors[0]) == "Literature search unavailable"
+    assert hypos[0].review_scores["novelty"] == 5

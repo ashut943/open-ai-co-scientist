@@ -48,6 +48,8 @@ class Hypothesis:
         self.is_active: bool = True
         self.parent_ids: List[str] = []  # Store IDs of parent hypotheses
         self.evolution_operator: Optional[str] = None  # REFINE|MUTATE|HYBRIDIZE|SIMPLIFY
+        self.literature: List[Dict] = []  # papers retrieved for this hypothesis's review
+        self.closest_prior_work: List[str] = []  # reviewer's novelty comparison to that literature
 
     def to_dict(self) -> dict:
         return {
@@ -69,6 +71,8 @@ class Hypothesis:
             "is_active": self.is_active,
             "parent_ids": self.parent_ids,
             "evolution_operator": self.evolution_operator,
+            "literature": self.literature,
+            "closest_prior_work": self.closest_prior_work,
         }
 
 
@@ -83,9 +87,14 @@ class ResearchGoal:
         reflection_temperature: Optional[float] = None,
         elo_k_factor: Optional[int] = None,
         top_k_hypotheses: Optional[int] = None,
+        user_references: Optional[List[str]] = None,
     ):
         self.description = description
         self.constraints = constraints if constraints else {}
+        # Raw lines from the user (DOIs, arXiv IDs/URLs, PubMed IDs, or notes);
+        # resolved to metadata once, at the start of the first cycle.
+        self.user_references: List[str] = list(user_references or [])
+        self.resolved_references: Optional[List[Dict]] = None
         # Store runtime settings, falling back to config defaults if not provided
         if llm_model:
             self.llm_model = llm_model
@@ -143,6 +152,7 @@ class ResearchGoalRequest(BaseModel):
     reflection_temperature: Optional[float] = None
     elo_k_factor: Optional[int] = None
     top_k_hypotheses: Optional[int] = None
+    user_references: Optional[List[str]] = None
 
 
 class HypothesisResponse(BaseModel):
@@ -158,6 +168,7 @@ class HypothesisResponse(BaseModel):
     falsification_conditions: Optional[List[str]] = None
     safety_ethical_concerns: Optional[List[str]] = None
     recommended_improvements: Optional[List[str]] = None
+    closest_prior_work: Optional[List[str]] = None
     elo_score: float
     review_comments: List[str]
     references: List[str]

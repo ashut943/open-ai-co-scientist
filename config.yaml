@@ -33,6 +33,19 @@ elo_k_factor: 32
 # 0 runs a full round-robin, which grows as n*(n-1)/2.
 tournament_matches_per_hypothesis: 3
 
+# Literature grounding for reflection reviews (novelty/feasibility) and for
+# resolving user-provided references. Sources: openalex, arxiv, semantic_scholar
+# (set SEMANTIC_SCHOLAR_API_KEY; unauthenticated requests are often rate
+# limited), pubmed (add for biomedical goals). Crossref resolves DOIs.
+# Set CO_SCIENTIST_DISABLE_LITERATURE=1 to turn all lookups off.
+literature_search:
+  enabled: true
+  sources: ["openalex", "arxiv"]
+  results_per_source: 3
+  max_papers_in_prompt: 6
+  timeout_seconds: 10
+  verify_cited_dois: true
+
 # Top K hypotheses for evolution
 top_k_hypotheses: 2
 

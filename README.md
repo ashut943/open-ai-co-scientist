@@ -24,7 +24,7 @@ A live demonstration can be accessed at: https://huggingface.co/spaces/liaoch/op
 - **Multi-Agent System:** Iteratively generates, reviews, ranks, and evolves research hypotheses using specialized agents (Generation, Reflection, Ranking, Evolution, Proximity, Meta-Review).
 - **LLM Integration:** Uses an OpenAI-compatible API (Parley by default; OpenRouter optional) with model selection in the UI.
 - **Interactive Gradio UI:** Easy-to-use interface for research goal input, advanced settings, and results visualization.
-- **References & Literature:** Integrated arXiv search for related papers.
+- **References & Literature:** Reviews are grounded in OpenAlex / arXiv (optionally Semantic Scholar, PubMed) searches, cited references are verified, and you can supply your own references and notes.
 - **Cost Control:** Automatically filters to cost-effective models in production deployment.
 - **Logging:** Each run is logged to a timestamped file in the `results/` directory.
 
@@ -83,6 +83,7 @@ In accordance with LLNL policy on Generative Artificial Intelligence, this proje
 ## 🎯 How to Use
 
 1. **Enter a research goal** in the provided textbox.
+   Optionally add **references and notes**, one per line: a DOI, an arXiv ID/URL, a PubMed ID/URL, or free text (e.g. "our pilot showed a 3% gain").
 2. **(Optional) Adjust advanced settings** such as LLM model, number of hypotheses, temperatures, etc.
 3. **Click "Run Cycle"** to generate, review, and evolve hypotheses.
 4. **View results, meta-review, and related literature** in the web interface.
@@ -105,9 +106,15 @@ The system uses a multi-agent approach:
 
 ## 📚 Literature Integration
 
-- Automatically searches arXiv for papers related to your research goal.
-- Displays relevant papers with full metadata, abstracts, and links.
-- Helps contextualize generated hypotheses within existing research.
+- **Grounded reviews:** before reviewing a hypothesis, the Reflection Agent searches the sources in `literature_search.sources` (default `openalex` and `arxiv`; `semantic_scholar` and `pubmed` are also available) in parallel. The top papers (`max_papers_in_prompt`, default 6) are shown to the reviewer as `[P1]`, `[P2]`, ... Novelty is judged against them, and the closest prior work is recorded.
+- **Your references:** lines from the "References and notes" box are resolved once per goal (Crossref for DOIs, arXiv, PubMed) and passed to the generation, reflection and evolution prompts as `[U1]`, `[U2]`, ... Lines that are not identifiers are kept as notes.
+- **No invented citations:** a cited reference is kept only if it maps to a `[P#]` or `[U#]` paper, or to a DOI that Crossref confirms exists. Anything else is dropped, and the drop is noted in the review.
+- **References tab:** shows your references, the papers each review was checked against, and related papers for the goal.
+- **Optional environment variables** (never put keys in `config.yaml`):
+  - `LITERATURE_CONTACT_EMAIL` sends a polite contact email to OpenAlex, Crossref and PubMed.
+  - `OPENALEX_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY` and `NCBI_API_KEY` raise each source's rate limit.
+  - `CO_SCIENTIST_DISABLE_LITERATURE=1` turns all lookups off.
+- **Failures are visible:** a source that fails (timeout, rate limit) is reported in the error box, and the review continues with whatever was retrieved.
 
 ## ⚙️ Technical Details
 

@@ -31,7 +31,7 @@ BUDGET_USD = 30.0
 # --- Token model (see "Token usage estimate" in docs/parley-models.md) ---
 # (input tokens, visible output tokens) per call.
 GENERATION = (250, 900)  # ~120-token template + goal + existing IDs -> 4 hypotheses x ~215 tokens
-REFLECTION = (550, 500)  # ~300-token template + goal + one hypothesis -> JSON review
+REFLECTION = (1800, 600)  # ~450-token template + goal + hypothesis + 6 papers x ~185 -> JSON review
 JUDGE = (1300, 200)  # ~200-token template + goal + 2 x (hypothesis ~215 + formatted review ~300)
 EVOLUTION = (2250, 300)  # template + parent(s) with reviews + match feedback + meta-review summary
 META_OUT = 700
@@ -147,7 +147,7 @@ def draw_schematic(rows, avg_reasoning):
     _box(ax, 21, 34, 16, 14, "1b. New ideas", "1× LLM\nfresh hypotheses\nfrom the goal")
     _arrow(ax, (19.5, 41), (21, 41))
 
-    _box(ax, 41, 34, 16, 14, "2. Reflection", "1× LLM per new\nhypothesis\n(4 in cycle 1, then 8)")
+    _box(ax, 41, 34, 16, 14, "2. Reflection", "1× LLM per new hyp.\n+ free literature search\n(4 in cycle 1, then 8)")
     _box(ax, 60, 34, 16, 14, "3. Tournament", "LLM judge per match\n≈ n × 3 / 2 matches\n+ Elo update (local)")
     _box(ax, 79, 34, 18, 14, "4. Meta-review", "1× LLM over reviews\n+ match outcomes\n→ next evolution plan")
     _box(ax, 79, 15, 18, 12, "5. Proximity", "local embeddings\nsimilarity graph", llm=False)
@@ -172,7 +172,13 @@ def draw_schematic(rows, avg_reasoning):
 
     ax.add_patch(
         FancyBboxPatch(
-            (2, 1.5), 74, 22, boxstyle="round,pad=0,rounding_size=1.2", linewidth=1, edgecolor="#30363d", facecolor=PANEL
+            (2, 1.5),
+            74,
+            22,
+            boxstyle="round,pad=0,rounding_size=1.2",
+            linewidth=1,
+            edgecolor="#30363d",
+            facecolor=PANEL,
         )
     )
     ax.text(4, 20.8, "LLM calls and tokens per cycle (estimates, not measured)", color=TEXT, fontsize=11, weight="bold")
@@ -243,9 +249,7 @@ def draw_pareto(avg_in, avg_vis_out, avg_out):
     for p in points:
         ax.plot([p["cost_visible"], p["cost"]], [p["tb"], p["tb"]], color=GRAY, lw=1.5, alpha=0.6, zorder=2)
         ax.plot(p["cost_visible"], p["tb"], marker="|", color=GRAY, ms=10, mew=1.5, zorder=2)
-    ax.plot(
-        [p["cost"] for p in front], [p["tb"] for p in front], color=GREEN, lw=2.5, zorder=3, label="Pareto front"
-    )
+    ax.plot([p["cost"] for p in front], [p["tb"] for p in front], color=GREEN, lw=2.5, zorder=3, label="Pareto front")
     dominated = [p for p in points if p["label"] not in front_labels]
     ax.scatter(
         [p["cost"] for p in dominated],
@@ -257,7 +261,13 @@ def draw_pareto(avg_in, avg_vis_out, avg_out):
         label="Dominated",
     )
     ax.scatter(
-        [p["cost"] for p in front], [p["tb"] for p in front], s=130, color=GREEN, edgecolor=TEXT, zorder=5, label="Pareto"
+        [p["cost"] for p in front],
+        [p["tb"] for p in front],
+        s=130,
+        color=GREEN,
+        edgecolor=TEXT,
+        zorder=5,
+        label="Pareto",
     )
     ax.plot([], [], color=GRAY, marker="|", ms=10, lw=1.5, label="Range down to visible-output-only cost")
 

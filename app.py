@@ -14,7 +14,7 @@ from app.agents import SupervisorAgent
 from app.config import config
 from app.models import ContextMemory, ResearchGoal
 from app.run_store import delete_run, get_reports_dir, history_html, list_runs, report_file_url, save_run, write_report
-from app.tools.arxiv_search import ArxivSearchTool
+from app.tools.literature import LiteratureSearch, citation, literature_enabled, parse_reference_lines
 from app.utils import (
     classify_llm_error,
     fetch_free_models,
@@ -164,14 +164,27 @@ def set_research_goal(
     reflection_temperature: float = 0.5,
     elo_k_factor: int = 32,
     top_k_hypotheses: int = 2,
+    user_references_text: str = "",
 ) -> Tuple[str, str]:
-    """Set the research goal and initialize the system."""
+    """Set the research goal and initialize the system.
+
+    The accumulated hypotheses are kept when the goal and references are
+    unchanged, so repeated Run Cycle clicks continue the same session (evolution
+    starts in cycle 2). Changing either starts a fresh session.
+    """
     global current_research_goal, global_context
 
     if not description.strip():
         return "❌ Error: Please enter a research goal.", ""
 
     try:
+        references = parse_reference_lines(user_references_text)
+        previous = current_research_goal
+        same_session = (
+            previous is not None
+            and previous.description == description.strip()
+            and previous.user_references == references
+        )
         # Create research goal with settings
         current_research_goal = ResearchGoal(
             description=description.strip(),
@@ -182,15 +195,26 @@ def set_research_goal(
             reflection_temperature=reflection_temperature,
             elo_k_factor=elo_k_factor,
             top_k_hypotheses=top_k_hypotheses,
+            user_references=references,
         )
 
-        # Reset context
-        global_context = ContextMemory()
+        if same_session:
+            current_research_goal.resolved_references = previous.resolved_references
+        else:
+            global_context = ContextMemory()
 
         logger.info(f"Research goal set: {description}")
         logger.info(f"Settings: model={current_research_goal.llm_model}, num={current_research_goal.num_hypotheses}")
 
-        status_msg = f"✅ Research goal set successfully!\n\n**Goal:** {description}\n**Model:** {current_research_goal.llm_model or 'Default'}\n**Hypotheses per cycle:** {num_hypotheses}"
+        next_cycle = global_context.iteration_number + 1
+        session_note = (
+            f"Continuing this goal: cycle {next_cycle}." if same_session else "New goal: starting at cycle 1."
+        )
+        status_msg = (
+            f"✅ Research goal set successfully!\n\n**Goal:** {description}\n"
+            f"**Model:** {current_research_goal.llm_model or 'Default'}\n**Hypotheses per cycle:** {num_hypotheses}\n"
+            f"**References provided:** {len(references)}\n{session_note}"
+        )
 
         return status_msg, "Ready to run first cycle. Click 'Run Cycle' to begin."
 
@@ -419,11 +443,19 @@ def _hypothesis_review_html(hypo: Dict[str, Any]) -> str:
         ("Falsification conditions", "falsification_conditions"),
         ("Safety / ethics", "safety_ethical_concerns"),
         ("Recommended improvements", "recommended_improvements"),
+        ("Closest prior work", "closest_prior_work"),
+        ("References", "references"),
     ):
         values = hypo.get(key) or []
         if values:
             items = "".join(f"<li>{html_lib.escape(str(v))}</li>" for v in values)
             parts.append(f"<p><strong>{label}:</strong></p><ul>{items}</ul>")
+    literature = hypo.get("literature") or []
+    if literature:
+        sources = ", ".join(sorted({str(p.get("source")) for p in literature}))
+        parts.append(
+            f"<p><em>Novelty checked against {len(literature)} retrieved papers ({html_lib.escape(sources)}).</em></p>"
+        )
     comments = hypo.get("review_comments") or hypo.get("comments")
     if comments:
         if isinstance(comments, list):
@@ -745,39 +777,62 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
 
 
 def get_references_html(cycle_details: Dict, research_goal: Optional[ResearchGoal] = None) -> str:
-    """Get references HTML for the cycle."""
+    """References panel: the user's references, papers used in reviews, and goal-level search results."""
+    import html as html_lib
+
+    def paper_card(paper: Dict[str, Any], note: str = "") -> str:
+        url = str(paper.get("url") or "")
+        link = (
+            f' <a href="{html_lib.escape(url)}" target="_blank" rel="noopener">link</a>'
+            if url.startswith(("http://", "https://"))
+            else ""
+        )
+        abstract = str(paper.get("abstract") or "")
+        abstract_html = (
+            f"<p>{html_lib.escape(abstract[:300])}{'…' if len(abstract) > 300 else ''}</p>" if abstract else ""
+        )
+        note_html = f"<p><em>{html_lib.escape(note)}</em></p>" if note else ""
+        return (
+            '<div style="border: 1px solid #e0e0e0; padding: 12px; margin: 8px 0; border-radius: 8px;">'
+            f"<p><strong>{html_lib.escape(citation(paper))}</strong>{link}</p>{note_html}{abstract_html}</div>"
+        )
+
+    goal = research_goal or current_research_goal
+    sections = []
     try:
-        # Search for arXiv papers related to the research goal
-        goal = research_goal or current_research_goal
-        if goal and goal.description:
-            arxiv_tool = ArxivSearchTool(max_results=5)
-            papers = arxiv_tool.search_papers(query=goal.description, max_results=5, sort_by="relevance")
+        user_refs = (goal.resolved_references if goal else None) or cycle_details.get("user_references") or []
+        if user_refs:
+            cards = "".join(
+                paper_card(ref, f"{ref.get('label')} · {ref.get('source', 'your note')}") for ref in user_refs
+            )
+            sections.append(f"<h3>📌 Your references</h3>{cards}")
 
+        used: Dict[str, Dict[str, Any]] = {}
+        for step in cycle_details.get("steps", {}).values():
+            for hypo in step.get("hypotheses", []) if isinstance(step, dict) else []:
+                for paper in hypo.get("literature") or []:
+                    key = (paper.get("doi") or paper.get("title") or "").lower()
+                    entry = used.setdefault(key, {"paper": paper, "ids": set()})
+                    entry["ids"].add(hypo.get("id"))
+        if used:
+            cards = "".join(
+                paper_card(e["paper"], f"{e['paper'].get('source')} · checked for {', '.join(sorted(e['ids']))}")
+                for e in used.values()
+            )
+            sections.append(f"<h3>🔎 Literature used in this cycle's reviews</h3>{cards}")
+
+        if goal and goal.description and literature_enabled():
+            papers, errors = LiteratureSearch().search(goal.description)
             if papers:
-                html = "<h3>📚 Related arXiv Papers</h3>"
-                for paper in papers:
-                    html += f"""
-                    <div style="border: 1px solid #e0e0e0; padding: 15px; margin: 10px 0; border-radius: 8px; background-color: #fafafa;">
-                        <h4>{paper.get("title", "Untitled")}</h4>
-                        <p><strong>Authors:</strong> {", ".join(paper.get("authors", [])[:5])}</p>
-                        <p><strong>arXiv ID:</strong> {paper.get("arxiv_id", "Unknown")} | 
-                           <strong>Published:</strong> {paper.get("published", "Unknown")}</p>
-                        <p><strong>Abstract:</strong> {paper.get("abstract", "No abstract")[:300]}...</p>
-                        <p>
-                            <a href="{paper.get("arxiv_url", "#")}" target="_blank">📄 View on arXiv</a> | 
-                            <a href="{paper.get("pdf_url", "#")}" target="_blank">📁 Download PDF</a>
-                        </p>
-                    </div>
-                    """
-                return html
-            else:
-                return "<p>No related arXiv papers found.</p>"
-        else:
-            return "<p>No research goal set for reference search.</p>"
-
+                cards = "".join(paper_card(p, str(p.get("source"))) for p in papers)
+                sections.append(f"<h3>📚 Related papers for the research goal</h3>{cards}")
+            for error in errors:
+                sections.append(f'<p style="color: #c0392b;">{html_lib.escape(error)}</p>')
     except Exception as e:
-        logger.error(f"Error fetching references: {e}")
-        return f"<p>Error loading references: {str(e)}</p>"
+        logger.error(f"Error building references: {e}")
+        sections.append(f"<p>Error loading references: {html_lib.escape(str(e))}</p>")
+
+    return "".join(sections) or "<p>No references for this cycle.</p>"
 
 
 def create_gradio_interface():
@@ -818,6 +873,18 @@ def create_gradio_interface():
                     label="Research Goal",
                     placeholder="Enter your research goal (e.g., 'Develop new methods for increasing the efficiency of solar panels')",
                     lines=3,
+                )
+                references_input = gr.Textbox(
+                    label="Your references and notes (optional)",
+                    placeholder=(
+                        "One per line: a DOI (10.1038/...), an arXiv ID or URL (2301.12345), a PubMed ID "
+                        "(PMID: 12345678), or a free-text note such as a key finding or constraint."
+                    ),
+                    info=(
+                        "Identifiers are looked up (Crossref, arXiv, PubMed) and used when generating, reviewing, "
+                        "and evolving hypotheses. Changing the goal or references starts a new session."
+                    ),
+                    lines=4,
                 )
 
                 # Advanced settings
@@ -875,8 +942,9 @@ def create_gradio_interface():
                 ### 📖 Instructions
 
                 1. **Enter Research Goal**: Describe what you want to research.
-                2. **Adjust Settings** (optional): Customize model and parameters.
-                3. **Click "Run Cycle"**: The system will set your goal and immediately generate, review, rank, and evolve hypotheses in one step.
+                2. **Add References** (optional): DOIs, arXiv IDs, PubMed IDs, or notes the agents should build on.
+                3. **Adjust Settings** (optional): Customize model and parameters.
+                4. **Click "Run Cycle"**: Generates, reviews (checked against retrieved literature), and ranks hypotheses. Click again to continue the same goal: evolution starts in cycle 2.
 
                 ### 💡 Tips
                 - Start with 4 hypotheses per cycle on the public free-model demo
@@ -917,7 +985,14 @@ def create_gradio_interface():
 
         # Event handler: single button sets research goal and runs cycle
         def run_full_cycle(
-            research_goal, llm_model, num_hypotheses, generation_temp, reflection_temp, elo_k_factor, top_k_hypotheses
+            research_goal,
+            references_text,
+            llm_model,
+            num_hypotheses,
+            generation_temp,
+            reflection_temp,
+            elo_k_factor,
+            top_k_hypotheses,
         ):
             # Set research goal
             status_msg, _ = set_research_goal(
@@ -928,6 +1003,7 @@ def create_gradio_interface():
                 reflection_temp,
                 elo_k_factor,
                 top_k_hypotheses,
+                user_references_text=references_text,
             )
             yield (
                 f"{status_msg}\n\nStarting cycle with a {format_timeout_duration(CYCLE_TIMEOUT_SECONDS)} limit.",
@@ -949,6 +1025,7 @@ def create_gradio_interface():
             fn=run_full_cycle,
             inputs=[
                 research_goal_input,
+                references_input,
                 model_dropdown,
                 num_hypotheses,
                 generation_temp,

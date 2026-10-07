@@ -36,7 +36,13 @@ logger = logging.getLogger("aicoscientist")  # Use a specific name for the app l
 # --- Secret Redaction ---
 def redact_secrets(text: str) -> str:
     """Removes API keys from text destined for logs or user-facing errors."""
-    for variable in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+    for variable in (
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENALEX_API_KEY",
+        "SEMANTIC_SCHOLAR_API_KEY",
+        "NCBI_API_KEY",
+    ):
         api_key = os.getenv(variable)
         if api_key and api_key in text:
             text = text.replace(api_key, "***REDACTED***")
@@ -64,7 +70,12 @@ def classify_llm_error(error_text: str) -> str:
     real cause (see GOALS.md theme 1: errors must be actionable, never silent).
     """
     text = (error_text or "").lower()
-    # Order matters: most specific first.
+    # Order matters: most specific first. Literature errors come first so a
+    # literature timeout is not reported as an LLM provider timeout.
+    if text.startswith("literature search"):
+        return "Literature search unavailable"
+    if text.startswith("could not resolve reference"):
+        return "Reference could not be resolved"
     if (
         "api key not set" in text
         or "401" in text

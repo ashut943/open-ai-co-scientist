@@ -6,6 +6,15 @@ from typing import Dict, List, Tuple
 # Import necessary components from other modules
 from .config import config
 from .models import REVIEW_SCORE_KEYS, ContextMemory, Hypothesis, ResearchGoal
+from .tools.literature import (
+    LiteratureSearch,
+    crossref_doi_exists,
+    format_papers_block,
+    ground_references,
+    hypothesis_query,
+    literature_settings,
+    resolve_references,
+)
 from .utils import (
     call_llm,
     generate_unique_id,
@@ -113,22 +122,50 @@ def call_llm_for_reflection(
     temperature: float = 0.5,
     model: str | None = None,
     research_goal: str | None = None,
+    literature: List[Dict] | None = None,
+    user_references: List[Dict] | None = None,
 ) -> Dict:
-    """Peer-review a hypothesis with numeric criterion scores and structured critique."""
+    """Peer-review a hypothesis with numeric criterion scores and structured critique.
+
+    `literature` (retrieved papers, labelled P1..Pn) and `user_references`
+    (labelled U1..Un) ground the novelty/feasibility judgment and are the only
+    sources the reviewer may cite.
+    """
     logger.info("LLM reflection called with temperature: %.2f", temperature)
     goal_block = research_goal.strip() if research_goal else "Not provided."
     criteria = ", ".join(REVIEW_SCORE_KEYS)
+    evidence = ""
+    if user_references:
+        evidence += f"User-provided references and notes:\n{format_papers_block(user_references)}\n\n"
+    if literature:
+        evidence += (
+            "Retrieved literature (top search results for this hypothesis; may be incomplete):\n"
+            f"{format_papers_block(literature, label_prefix='P')}\n\n"
+        )
+    if evidence:
+        grounding = (
+            "Judge novelty against the papers above: if one already proposes or demonstrates the core idea, "
+            "novelty must be 1-2 and closest_prior_work must say which paper and how it overlaps. Use them to "
+            "judge feasibility (are the methods or materials already demonstrated?). Absence from these results "
+            "does not prove novelty. In references, cite ONLY the labels above (e.g. 'P2', 'U1'); citations to "
+            "anything else are discarded.\n\n"
+        )
+    else:
+        evidence = "No literature was retrieved for this review.\n\n"
+        grounding = (
+            "Judge novelty from your own knowledge and say so in the comment. Only cite papers by DOI that you "
+            "are certain exist; citations that cannot be verified are discarded.\n\n"
+        )
     prompt = (
         f"You are a scientific peer reviewer.\n\n"
         f"Research goal:\n{goal_block}\n\n"
         f"Hypothesis:\n{hypothesis_text}\n\n"
+        f"{evidence}"
         f"Score the hypothesis from 1-5 on each criterion: {criteria}.\n"
         f"Also identify strengths, weaknesses, critical assumptions, falsification "
         f"conditions (what observation/experiment would refute it), safety/ethical "
         f"concerns, and recommended improvements.\n\n"
-        f"For references, provide arXiv IDs (e.g., '2301.12345'), DOIs, or paper "
-        f"titles with venues. Do not provide PubMed IDs unless this is specifically "
-        f"a biomedical/life-sciences hypothesis.\n\n"
+        f"{grounding}"
         f"Return ONLY a JSON object with keys:\n"
         f'  "review_scores": object with keys {list(REVIEW_SCORE_KEYS)} and integer values 1-5,\n'
         f'  "review_strengths": list of strings,\n'
@@ -137,6 +174,7 @@ def call_llm_for_reflection(
         f'  "falsification_conditions": list of strings,\n'
         f'  "safety_ethical_concerns": list of strings,\n'
         f'  "recommended_improvements": list of strings,\n'
+        f'  "closest_prior_work": list of strings, each "<label>: how it overlaps or differs",\n'
         f'  "comment": brief overall summary string,\n'
         f'  "references": list of strings.\n'
     )
@@ -155,6 +193,7 @@ def call_llm_for_reflection(
         "falsification_conditions": [],
         "safety_ethical_concerns": [],
         "recommended_improvements": [],
+        "closest_prior_work": [],
         "comment": "",
         "references": [],
         "error": None,
@@ -189,6 +228,7 @@ def call_llm_for_reflection(
             "falsification_conditions",
             "safety_ethical_concerns",
             "recommended_improvements",
+            "closest_prior_work",
         ):
             review_data[list_key] = _coerce_str_list(parsed_data.get(list_key))
 
@@ -229,6 +269,8 @@ def _format_hypothesis_reviews(hypothesis: Hypothesis) -> str:
         parts.append("Safety/ethics: " + "; ".join(hypothesis.safety_ethical_concerns))
     if hypothesis.recommended_improvements:
         parts.append("Recommended improvements: " + "; ".join(hypothesis.recommended_improvements))
+    if hypothesis.closest_prior_work:
+        parts.append("Closest prior work: " + "; ".join(hypothesis.closest_prior_work))
     if hypothesis.review_comments:
         parts.append(f"Comments: {'; '.join(hypothesis.review_comments)}")
     return "\n".join(parts) if parts else "No prior reviews available."
@@ -540,6 +582,16 @@ def _latest_meta_review_summary(context: ContextMemory) -> str:
     return "\n".join(parts) if parts else "No meta-review feedback available yet."
 
 
+def _user_references_block(research_goal: ResearchGoal) -> str:
+    """Prompt block for the user's own references; empty when there are none."""
+    if not research_goal.resolved_references:
+        return ""
+    return (
+        "User-provided references and notes (build on them; do not merely restate them):\n"
+        f"{format_papers_block(research_goal.resolved_references, abstract_chars=300)}\n\n"
+    )
+
+
 def _format_parent_block(hypothesis: Hypothesis) -> str:
     return (
         f"ID: {hypothesis.hypothesis_id}\n"
@@ -581,6 +633,7 @@ def call_llm_for_evolution(
         f"{_tournament_feedback_for(context, parent_ids)}\n\n"
         f"Latest meta-review guidance (should steer this evolution):\n"
         f"{_latest_meta_review_summary(context)}\n\n"
+        f"{_user_references_block(research_goal)}"
         f"Return ONLY a JSON object with keys:\n"
         f'  "title": short title for the NEW child hypothesis,\n'
         f'  "text": full statement of the NEW child hypothesis,\n'
@@ -673,6 +726,7 @@ class GenerationAgent:
         prompt = (
             f"Research Goal: {research_goal.description}\n"
             f"Constraints: {research_goal.constraints}\n"
+            f"{_user_references_block(research_goal)}"
             f"Existing Hypothesis IDs: {list(context.hypotheses.keys())}\n"  # Provide context
             f"Please propose {num_to_generate} novel and feasible hypotheses with rationale, avoiding duplication with existing IDs.\n"
         )
@@ -703,24 +757,50 @@ class GenerationAgent:
         return new_hypos, errors
 
 
+def _literature_summary(paper: Dict) -> Dict:
+    keys = ("source", "title", "year", "venue", "authors", "doi", "url")
+    return {key: paper.get(key) for key in keys}
+
+
+def _summarize_literature_errors(errors: List[str]) -> List[str]:
+    """Collapse per-search failures into one message per distinct cause."""
+    counts: Dict[str, int] = {}
+    for message in errors:
+        counts[message] = counts.get(message, 0) + 1
+    return [f"{message} ({count} searches)" if count > 1 else message for message, count in counts.items()]
+
+
 class ReflectionAgent:
+    def __init__(self, literature: LiteratureSearch | None = None):
+        self.literature = literature or LiteratureSearch()
+
     def review_hypotheses(
         self, hypotheses: List[Hypothesis], context: ContextMemory, research_goal: ResearchGoal
     ) -> List[str]:
         """Peer-review hypotheses with structured scores and scientific critique.
 
-        Returns error messages for reviews that failed. A failed review leaves
-        any earlier successful review on the hypothesis untouched.
+        Each review is grounded in a literature search for that hypothesis plus
+        the user's references; cited references are kept only if they map onto
+        those papers or a DOI that Crossref confirms. Returns error messages for
+        failed reviews and literature searches. A failed review leaves any
+        earlier successful review on the hypothesis untouched.
         """
         reflect_temp = research_goal.reflection_temperature
+        user_refs = research_goal.resolved_references or []
+        verify = crossref_doi_exists if literature_settings().get("verify_cited_dois", True) else None
         failed: Dict[str, str] = {}
+        literature_errors: List[str] = []
 
         for h in hypotheses:
+            papers, search_errors = self.literature.search(hypothesis_query(h.title, h.text))
+            literature_errors.extend(search_errors)
             result = call_llm_for_reflection(
                 h.text,
                 temperature=reflect_temp,
                 model=research_goal.llm_model,
                 research_goal=research_goal.description,
+                literature=papers,
+                user_references=user_refs,
             )
             if result.get("error"):
                 failed[h.hypothesis_id] = result["error"]
@@ -737,10 +817,19 @@ class ReflectionAgent:
             h.falsification_conditions = result.get("falsification_conditions") or []
             h.safety_ethical_concerns = result.get("safety_ethical_concerns") or []
             h.recommended_improvements = result.get("recommended_improvements") or []
+            h.closest_prior_work = result.get("closest_prior_work") or []
+            h.literature = [_literature_summary(p) for p in papers]
             if result["comment"]:
                 h.review_comments.append(result["comment"])
-            if result["references"]:
-                h.references.extend(result["references"])
+            grounded, dropped = ground_references(result["references"], papers, user_refs, verify_doi=verify)
+            for ref in grounded:
+                if ref not in h.references:
+                    h.references.append(ref)
+            if dropped:
+                h.review_comments.append(
+                    f"Dropped {dropped} cited reference(s) that did not match retrieved or user-provided "
+                    "papers and could not be verified."
+                )
             logger.info(
                 "Reviewed hypothesis: %s, Novelty: %s, Feasibility: %s, Scores: %s",
                 h.hypothesis_id,
@@ -749,13 +838,14 @@ class ReflectionAgent:
                 h.review_scores,
             )
 
-        if not failed:
-            return []
-        reasons = " | ".join(dict.fromkeys(failed.values()))
-        return [
-            f"Reflection review failed for {len(failed)} of {len(hypotheses)} hypotheses "
-            f"({', '.join(failed)}); they keep any earlier review, otherwise stay unreviewed: {reasons}"
-        ]
+        errors = _summarize_literature_errors(literature_errors)
+        if failed:
+            reasons = " | ".join(dict.fromkeys(failed.values()))
+            errors.append(
+                f"Reflection review failed for {len(failed)} of {len(hypotheses)} hypotheses "
+                f"({', '.join(failed)}); they keep any earlier review, otherwise stay unreviewed: {reasons}"
+            )
+        return errors
 
 
 def _has_review(h: Hypothesis) -> bool:
@@ -1256,6 +1346,12 @@ class SupervisorAgent:
         # Every step's failures are collected here so the UI can show them;
         # fallbacks keep the cycle running but must not look like success.
         errors: List[str] = []
+
+        # 0. Resolve the user's references once per research goal.
+        if research_goal.resolved_references is None:
+            research_goal.resolved_references, reference_errors = resolve_references(research_goal.user_references)
+            errors += reference_errors
+        cycle_details["user_references"] = research_goal.resolved_references
 
         # 1. Generation. Evolution runs before fresh generation so its top
         # candidates are ranked hypotheses, not unjudged new ones at default Elo.

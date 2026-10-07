@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Reflection reviews are now grounded in a literature search per hypothesis
+  (default sources: OpenAlex + arXiv; Semantic Scholar and PubMed are opt-in
+  via `literature_search.sources`). Retrieved papers are shown to the reviewer
+  as `[P#]`, novelty must be judged against them, and each hypothesis records
+  its `closest_prior_work` and the papers it was checked against. Cited
+  references are kept only when they map to a retrieved or user-provided paper
+  or to a DOI that Crossref confirms exists; others are dropped and counted.
+  Search failures (timeouts, rate limits) appear in the error box.
+- A "References and notes" box under the research goal. Each line may be a DOI,
+  an arXiv ID/URL, a PubMed ID/URL, or a free-text note. Identifiers are resolved
+  once per goal (Crossref / arXiv / PubMed) and given to generation,
+  reflection and evolution prompts as `[U#]`. The References tab lists your
+  references, the literature each review used, and related papers for the goal.
+- Optional environment variables: `LITERATURE_CONTACT_EMAIL`,
+  `OPENALEX_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `NCBI_API_KEY`;
+  `CO_SCIENTIST_DISABLE_LITERATURE=1` turns all lookups off.
+
+### Fixed
+- Clicking "Set Research Goal" again with the same goal and references no
+  longer wipes the session, so later cycles (and evolution) actually run.
+
 ### Changed
 - Failures after generation are no longer silent. If a reflection review,
   tournament judgment, meta-review, or evolution operator fails, the cause is
