@@ -56,6 +56,18 @@ def test_reflection_parses_rich_schema_and_derives_ordinals():
     assert mock_call.call_args.kwargs["model"] == "gpt-5-mini"
 
 
+def test_reflection_tolerates_single_backslash_latex():
+    payload = _rich_payload(review_weaknesses=["BOUND"]).replace(
+        '"BOUND"', r'"Bound $2/\dot{\sigma}_X$ uses \frac and \nabla; ok \\alpha\n next"'
+    )
+
+    with patch("app.agents.call_llm", return_value=payload):
+        review = call_llm_for_reflection("Hypothesis", model="m", research_goal="Goal")
+
+    assert review["error"] is None
+    assert review["review_weaknesses"] == ["Bound $2/\\dot{\\sigma}_X$ uses \\frac and \\nabla; ok \\alpha\n next"]
+
+
 def test_reflection_handles_fenced_json():
     payload = "```json\n" + _rich_payload() + "\n```"
     with patch("app.agents.call_llm", return_value=payload):
@@ -168,6 +180,37 @@ def test_reflection_prompt_includes_literature_and_user_references():
     assert "[P1]" in prompt and "Perovskite tandems at scale" in prompt
     assert "[U1] Note from the user: Pilot showed a 3% gain" in prompt
     assert "closest_prior_work" in prompt
+    assert "relevant_papers" in prompt
+
+
+def test_reflection_agent_keeps_only_papers_the_reviewer_judged_relevant():
+    goal = ResearchGoal(description="Goal")
+    context = ContextMemory()
+    hypo = Hypothesis("G1", "Activity bounds under feedback", "body")
+    context.add_hypothesis(hypo)
+    on_topic = lit._paper("openalex", "W1", "Dynamical activity bounds precision", doi="10.1000/act")
+    off_topic = lit._paper("arxiv", "2301.1", "PressureTransferNet: ground pressure from video")
+    searcher = _FakeLiterature([off_topic, on_topic])
+
+    with patch("app.agents.call_llm", return_value=_rich_payload(relevant_papers=["P2"], references=["P2"])):
+        ReflectionAgent(literature=searcher).review_hypotheses([hypo], context, goal)
+
+    assert [p["title"] for p in hypo.literature] == ["Dynamical activity bounds precision"]
+    assert hypo.literature_retrieved == 2
+    assert hypo.references == [lit.citation(on_topic)]
+
+
+def test_reflection_agent_keeps_all_papers_when_reviewer_omits_relevance():
+    goal = ResearchGoal(description="Goal")
+    context = ContextMemory()
+    hypo = Hypothesis("G1", "Activity bounds under feedback", "body")
+    context.add_hypothesis(hypo)
+    papers = [lit._paper("openalex", "W1", "A"), lit._paper("openalex", "W2", "B")]
+
+    with patch("app.agents.call_llm", return_value=_rich_payload()):
+        ReflectionAgent(literature=_FakeLiterature(papers)).review_hypotheses([hypo], context, goal)
+
+    assert len(hypo.literature) == 2
 
 
 def test_reflection_agent_grounds_review_in_literature_and_user_references():
@@ -192,8 +235,22 @@ def test_reflection_agent_grounds_review_in_literature_and_user_references():
     assert searcher.queries == ["Perovskite silicon tandem stability"]
     assert hypo.closest_prior_work == ["P1: same tandem architecture"]
     assert hypo.literature[0]["doi"] == "10.1000/tandem"
-    assert hypo.references == [lit.citation(paper), "Note: Pilot showed a 3% gain"]
+    assert hypo.references == [lit.citation(paper)]
     assert any("Dropped 1 cited reference" in c for c in hypo.review_comments)
+
+
+def test_reflection_agent_searches_with_llm_keywords_when_present():
+    goal = ResearchGoal(description="Goal")
+    context = ContextMemory()
+    hypo = Hypothesis("G1", "Hybrid Informational-Kinetic Uncertainty Relation", "body")
+    hypo.search_keywords = "thermodynamic uncertainty relation feedback"
+    context.add_hypothesis(hypo)
+    searcher = _FakeLiterature([])
+
+    with patch("app.agents.call_llm", return_value=_rich_payload()):
+        ReflectionAgent(literature=searcher).review_hypotheses([hypo], context, goal)
+
+    assert searcher.queries == ["thermodynamic uncertainty relation feedback"]
 
 
 def test_reflection_agent_surfaces_literature_failures_once_per_cause():

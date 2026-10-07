@@ -1,3 +1,4 @@
+import html as html_lib
 import logging
 import os
 import threading
@@ -13,7 +14,17 @@ from app.agents import SupervisorAgent
 # Import the existing app components
 from app.config import config
 from app.models import ContextMemory, ResearchGoal
-from app.run_store import delete_run, get_reports_dir, history_html, list_runs, report_file_url, save_run, write_report
+from app.plots import cycle_plots_html
+from app.run_store import (
+    delete_run,
+    get_reports_dir,
+    history_html,
+    list_runs,
+    pdf_report_path,
+    report_file_url,
+    save_run,
+    write_report,
+)
 from app.tools.literature import LiteratureSearch, citation, literature_enabled, parse_reference_lines
 from app.utils import (
     classify_llm_error,
@@ -314,8 +325,14 @@ def persist_cycle_result(research_goal: ResearchGoal, cycle_result: Dict[str, An
         log_file=cycle_result["log_file"],
     )
     report_path = write_report(saved_run)
-    status_msg = f"{cycle_result['status']}\nRun ID: {saved_run['run_id']}\nReport: {report_file_url(report_path)}"
+    status_msg = f"{cycle_result['status']}\nRun ID: {saved_run['run_id']}\n{report_lines(report_path)}"
     return status_msg, cycle_result["results_html"], cycle_result["references_html"]
+
+
+def report_lines(report_path) -> str:
+    lines = f"Report: {report_file_url(report_path)}"
+    pdf_path = pdf_report_path(report_path)
+    return lines + (f"\nPDF: {pdf_path.resolve()}" if pdf_path else "")
 
 
 def run_cycle() -> Tuple[str, str, str]:
@@ -333,17 +350,15 @@ def run_cycle() -> Tuple[str, str, str]:
 
 def format_timeout_duration(timeout_seconds: float) -> str:
     if timeout_seconds < 60:
-        return f"{timeout_seconds:g} seconds"
-    minutes = timeout_seconds / 60
-    if minutes.is_integer():
-        return f"{int(minutes)} minutes"
-    return f"{minutes:.1f} minutes"
+        return f"{timeout_seconds:.0f} seconds"
+    minutes, seconds = divmod(round(timeout_seconds), 60)
+    return f"{minutes} min" + (f" {seconds} s" if seconds else "")
 
 
 def timeout_results_html(timeout_seconds: float) -> str:
     timeout_duration = format_timeout_duration(timeout_seconds)
     return f"""
-    <div style="margin: 20px 0; padding: 15px; border: 2px solid #e67e22; border-radius: 8px; background-color: #fff8ee;">
+    <div style="margin: 20px 0; padding: 15px; border: 2px solid #e67e22; border-radius: 8px; background-color: rgba(230, 126, 34, 0.08);">
         <h3>Cycle stopped at the time limit</h3>
         <p>The run exceeded the {timeout_duration} upper limit before the app received a completed cycle.</p>
         <p>Try fewer hypotheses, a different model, or a later retry if the model provider is slow.</p>
@@ -398,7 +413,7 @@ def run_cycle_with_progress(
             )
             report_path = write_report(saved_run)
             yield (
-                f"{timeout_status}\nRun ID: {saved_run['run_id']}\nReport: {report_file_url(report_path)}",
+                f"{timeout_status}\nRun ID: {saved_run['run_id']}\n{report_lines(report_path)}",
                 timeout_html,
                 "",
             )
@@ -451,11 +466,21 @@ def _hypothesis_review_html(hypo: Dict[str, Any]) -> str:
             items = "".join(f"<li>{html_lib.escape(str(v))}</li>" for v in values)
             parts.append(f"<p><strong>{label}:</strong></p><ul>{items}</ul>")
     literature = hypo.get("literature") or []
+    retrieved = hypo.get("literature_retrieved") or len(literature)
+    keywords = hypo.get("search_keywords")
+    searched = f" Search: {html_lib.escape(keywords)}." if keywords else ""
     if literature:
         sources = ", ".join(sorted({str(p.get("source")) for p in literature}))
         parts.append(
-            f"<p><em>Novelty checked against {len(literature)} retrieved papers ({html_lib.escape(sources)}).</em></p>"
+            f"<p><em>Novelty checked against {len(literature)} relevant of {retrieved} retrieved papers "
+            f"({html_lib.escape(sources)}).{searched}</em></p>"
         )
+    elif retrieved:
+        parts.append(
+            f"<p><em>The reviewer judged none of the {retrieved} retrieved papers relevant.{searched}</em></p>"
+        )
+    elif searched:
+        parts.append(f"<p><em>No papers found for the literature search.{searched}</em></p>")
     comments = hypo.get("review_comments") or hypo.get("comments")
     if comments:
         if isinstance(comments, list):
@@ -481,7 +506,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
             category = classify_llm_error(e)
             items += f"<li><strong>{html_lib.escape(category)}:</strong> {html_lib.escape(str(e))}</li>"
         html += f"""
-        <div style="margin: 20px 0; padding: 15px; border: 2px solid #e74c3c; border-radius: 8px; background-color: #fff5f5;">
+        <div style="margin: 20px 0; padding: 15px; border: 2px solid #e74c3c; border-radius: 8px; background-color: rgba(231, 76, 60, 0.08);">
             <h3>⚠️ Some steps did not complete</h3>
             <p>The model/API reported the following. Affected steps were skipped or used a fallback, so the results below may be incomplete:</p>
             <ul style="color: #c0392b;">{items}</ul>
@@ -504,11 +529,11 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
         }.get(step_name, step_name.title())
 
         html += f"""
-        <details style="margin: 15px 0; border: 1px solid #ddd; border-radius: 8px; padding: 10px;">
+        <details style="margin: 15px 0; border: 1px solid rgba(127, 127, 127, 0.35); border-radius: 8px; padding: 10px;">
             <summary style="font-weight: bold; font-size: 1.1em; cursor: pointer; padding: 5px;">
                 {step_title}
             </summary>
-            <div style="margin-top: 10px; padding: 10px; background-color: #f8f9fa; border-radius: 5px;">
+            <div style="margin-top: 10px; padding: 10px; background-color: rgba(127, 127, 127, 0.08); border-radius: 5px;">
         """
 
         # Step-specific content
@@ -723,7 +748,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
             final_hypotheses = sorted(final_hypotheses, key=lambda h: h.get("id", ""))
 
         html += """
-        <div style="margin: 20px 0; padding: 15px; border: 2px solid #28a745; border-radius: 8px; background-color: #f8fff8;">
+        <div style="margin: 20px 0; padding: 15px; border: 2px solid #28a745; border-radius: 8px; background-color: rgba(40, 167, 69, 0.07);">
             <h3>🏆 Final Rankings - Top Hypotheses</h3>
         """
         if final_step not in ranking_steps:
@@ -743,7 +768,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
         for i, hypo in enumerate(final_hypotheses[:10]):  # Show top 10
             rank_color = "#28a745" if i < 3 else "#17a2b8" if i < 6 else "#6c757d"
             html += f"""
-            <div style="border-left: 4px solid {rank_color}; padding: 15px; margin: 10px 0; background-color: white; border-radius: 5px;">
+            <div style="border-left: 4px solid {rank_color}; padding: 15px; margin: 10px 0; background-color: rgba(127, 127, 127, 0.06); border-radius: 5px;">
                 <h4>#{i + 1}: {hypo.get("title", "Untitled")}</h4>
                 <p><strong>ID:</strong> {hypo.get("id", "Unknown")} | 
                    <strong>Elo Score:</strong> {hypo.get("elo_score", 0):.2f}</p>
@@ -753,6 +778,9 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
             """
 
         html += "</div>"
+        charts = cycle_plots_html(cycle_details)
+        if charts:
+            html += f'<div style="margin: 20px 0;"><h3>📈 Charts</h3>{charts}</div>'
     else:
         if errors:
             cause = "; ".join(sorted({classify_llm_error(e) for e in errors}))
@@ -763,7 +791,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
         else:
             no_rank_msg = "No hypotheses available for final ranking. This may indicate an error in the workflow."
         html += f"""
-        <div style="margin: 20px 0; padding: 15px; border: 2px solid #e74c3c; border-radius: 8px; background-color: #fff5f5;">
+        <div style="margin: 20px 0; padding: 15px; border: 2px solid #e74c3c; border-radius: 8px; background-color: rgba(231, 76, 60, 0.08);">
             <h3>🏆 Final Rankings - Top Hypotheses</h3>
             <p style="color: #e74c3c;">{no_rank_msg}</p>
         </div>
@@ -793,7 +821,7 @@ def get_references_html(cycle_details: Dict, research_goal: Optional[ResearchGoa
         )
         note_html = f"<p><em>{html_lib.escape(note)}</em></p>" if note else ""
         return (
-            '<div style="border: 1px solid #e0e0e0; padding: 12px; margin: 8px 0; border-radius: 8px;">'
+            '<div style="border: 1px solid rgba(127, 127, 127, 0.35); padding: 12px; margin: 8px 0; border-radius: 8px;">'
             f"<p><strong>{html_lib.escape(citation(paper))}</strong>{link}</p>{note_html}{abstract_html}</div>"
         )
 
@@ -835,47 +863,73 @@ def get_references_html(cycle_details: Dict, research_goal: Optional[ResearchGoa
     return "".join(sections) or "<p>No references for this cycle.</p>"
 
 
+APP_CSS = """
+.gradio-container { max-width: 1200px !important; margin: 0 auto !important; }
+#hero {
+    padding: 24px 28px;
+    border-radius: 16px;
+    background: linear-gradient(135deg, #4338ca 0%, #6d28d9 55%, #0369a1 100%);
+    color: #fff;
+}
+#hero h1 { margin: 0; font-size: 1.75rem; font-weight: 700; color: #fff; letter-spacing: -0.01em; }
+#hero p { margin: 6px 0 0; color: rgba(255, 255, 255, 0.88); font-size: 1rem; }
+#hero .pill {
+    display: inline-block;
+    margin-top: 14px;
+    padding: 3px 12px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.16);
+    color: #fff;
+    font-size: 0.8rem;
+}
+#side-card { font-size: 0.92rem; line-height: 1.55; }
+#side-card h3 { margin-top: 0; }
+#run-btn { min-height: 52px; font-size: 1.05rem; font-weight: 600; }
+#footer { text-align: center; margin-top: 24px; opacity: 0.7; font-size: 0.9rem; }
+#footer a { text-decoration: none; color: inherit; }
+"""
+
+
+def app_theme():
+    return gr.themes.Soft(
+        primary_hue="indigo",
+        secondary_hue="violet",
+        neutral_hue="slate",
+        font=[gr.themes.GoogleFont("Inter"), gr.themes.Font("ui-sans-serif"), gr.themes.Font("sans-serif")],
+    )
+
+
 def create_gradio_interface():
-    """Create the Gradio interface."""
+    """Create the Gradio interface. Gradio 6 takes theme/css in launch(): use APP_CSS and app_theme()."""
 
     # Fetch models on startup
     fetch_available_models()
 
     # Get deployment status
-    status_text, status_color = get_deployment_status()
+    status_text, _ = get_deployment_status()
 
-    with gr.Blocks(
-        title="Open AI Co-Scientist - Hypothesis Evolution System",
-        theme=gr.themes.Soft(),
-        css="""
-        .status-box {
-            padding: 10px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            font-weight: bold;
-        }
-        .orange { background-color: #fff3cd; border: 1px solid #ffeaa7; }
-        .blue { background-color: #d1ecf1; border: 1px solid #bee5eb; }
-        """,
-    ) as demo:
-        # Header
-        gr.Markdown("# 🔬 Open AI Co-Scientist - Hypothesis Evolution System")
-        gr.Markdown("Generate, review, rank, and evolve research hypotheses using AI agents.")
-
-        # Deployment status
-        gr.HTML(f'<div class="status-box {status_color}">🔧 Deployment Status: {status_text}</div>')
+    with gr.Blocks(title="Open AI Co-Scientist") as demo:
+        gr.HTML(
+            f"""
+            <div id="hero">
+                <h1>🔬 Open AI Co-Scientist</h1>
+                <p>Generate, review against the literature, rank, and evolve research hypotheses with AI agents.</p>
+                <span class="pill">{html_lib.escape(status_text)}</span>
+            </div>
+            """
+        )
 
         # Main interface
-        with gr.Row():
+        with gr.Row(equal_height=False):
             with gr.Column(scale=2):
                 # Research goal input
                 research_goal_input = gr.Textbox(
-                    label="Research Goal",
-                    placeholder="Enter your research goal (e.g., 'Develop new methods for increasing the efficiency of solar panels')",
-                    lines=3,
+                    label="Research goal",
+                    placeholder="e.g. Develop new methods for increasing the efficiency of solar panels",
+                    lines=4,
                 )
                 references_input = gr.Textbox(
-                    label="Your references and notes (optional)",
+                    label="References and notes (optional)",
                     placeholder=(
                         "One per line: a DOI (10.1038/...), an arXiv ID or URL (2301.12345), a PubMed ID "
                         "(PMID: 12345678), or a free-text note such as a key finding or constraint."
@@ -887,8 +941,20 @@ def create_gradio_interface():
                     lines=4,
                 )
 
+                gr.Examples(
+                    examples=[
+                        ["Develop new methods for increasing the efficiency of solar panels"],
+                        ["Create novel approaches to treat Alzheimer's disease"],
+                        ["Design sustainable materials for construction"],
+                        ["Improve machine learning model interpretability"],
+                        ["Develop new quantum computing algorithms"],
+                    ],
+                    inputs=[research_goal_input],
+                    label="Example goals",
+                )
+
                 # Advanced settings
-                with gr.Accordion("⚙️ Advanced Settings", open=False):
+                with gr.Accordion("⚙️ Advanced settings", open=False):
                     default_model = get_default_model_choice()
                     model_dropdown = gr.Dropdown(
                         choices=get_model_dropdown_choices(),
@@ -908,53 +974,50 @@ def create_gradio_interface():
                             maximum=10,
                             value=config.get("num_hypotheses", 4),
                             step=1,
-                            label="Hypotheses per Cycle",
+                            label="Hypotheses per cycle",
                         )
-                        top_k_hypotheses = gr.Slider(minimum=2, maximum=5, value=2, step=1, label="Top K for Evolution")
-
-                    with gr.Row():
-                        generation_temp = gr.Slider(
-                            minimum=0.1, maximum=1.0, value=0.7, step=0.1, label="Generation Temperature (Creativity)"
-                        )
-                        reflection_temp = gr.Slider(
-                            minimum=0.1, maximum=1.0, value=0.5, step=0.1, label="Reflection Temperature (Analysis)"
+                        top_k_hypotheses = gr.Slider(
+                            minimum=2, maximum=5, value=2, step=1, label="Top hypotheses to evolve"
                         )
 
                     elo_k_factor = gr.Slider(
-                        minimum=1, maximum=100, value=32, step=1, label="Elo K-Factor (Ranking Sensitivity)"
+                        minimum=1,
+                        maximum=100,
+                        value=32,
+                        step=1,
+                        label="Elo K-factor",
+                        info="How far one tournament match moves a hypothesis's rating.",
                     )
 
-                # Single action button
-                with gr.Row():
-                    run_cycle_btn = gr.Button("🔄 Run Cycle", variant="primary")
+                run_cycle_btn = gr.Button("▶  Run cycle", variant="primary", size="lg", elem_id="run-btn")
 
                 # Status display
                 status_output = gr.Textbox(
                     label="Status",
-                    value="Enter a research goal and click 'Run Cycle' to begin.",
+                    value="Enter a research goal and click Run cycle to begin.",
                     interactive=False,
                     lines=3,
                 )
 
-            with gr.Column(scale=1):
-                # Instructions
-                gr.Markdown("""
-                ### 📖 Instructions
+            with gr.Column(scale=1, variant="panel", elem_id="side-card"):
+                free_model_note = (
+                    ""
+                    if LLM_PROVIDER == "openai"
+                    else "\n- Free models can be slow or rate-limited; the app tries a few fallbacks automatically."
+                )
+                gr.Markdown(f"""
+### How a cycle works
+1. **Generate.** New hypotheses, plus (from cycle 2) evolved versions of the best ones.
+2. **Review.** Each new hypothesis is scored 1–5 after a literature search (OpenAlex, arXiv).
+3. **Rank.** An LLM judge runs a tournament; Elo ratings order the pool.
+4. **Meta-review.** Finds patterns and steers the next cycle's evolution.
 
-                1. **Enter Research Goal**: Describe what you want to research.
-                2. **Add References** (optional): DOIs, arXiv IDs, PubMed IDs, or notes the agents should build on.
-                3. **Adjust Settings** (optional): Customize model and parameters.
-                4. **Click "Run Cycle"**: Generates, reviews (checked against retrieved literature), and ranks hypotheses. Click again to continue the same goal: evolution starts in cycle 2.
-
-                ### 💡 Tips
-                - Start with 4 hypotheses per cycle on the public free-model demo
-                - Compact free models are listed first; try another recommended free model if one provider is slow
-                - Higher generation temperature = more creative ideas
-                - Lower reflection temperature = more analytical reviews
-                - Each cycle builds on previous results
-                
-                **Note:** Free models can be rate-limited or slow. The app will try a few free fallbacks automatically, and you can select a different recommended free model in Advanced Settings.
-                """)
+### Tips
+- Click **Run cycle** again to continue the same goal.
+- Changing the goal or references starts a new session.
+- Start with 3–4 hypotheses per cycle to keep runs fast and cheap.
+- Your references show up as **[U1]**, **[U2]**…; retrieved papers as **[P1]**…{free_model_note}
+""")
 
         with gr.Tabs():
             with gr.Tab("Current Run"):
@@ -989,8 +1052,6 @@ def create_gradio_interface():
             references_text,
             llm_model,
             num_hypotheses,
-            generation_temp,
-            reflection_temp,
             elo_k_factor,
             top_k_hypotheses,
         ):
@@ -999,10 +1060,8 @@ def create_gradio_interface():
                 research_goal,
                 llm_model,
                 num_hypotheses,
-                generation_temp,
-                reflection_temp,
-                elo_k_factor,
-                top_k_hypotheses,
+                elo_k_factor=elo_k_factor,
+                top_k_hypotheses=top_k_hypotheses,
                 user_references_text=references_text,
             )
             yield (
@@ -1028,8 +1087,6 @@ def create_gradio_interface():
                 references_input,
                 model_dropdown,
                 num_hypotheses,
-                generation_temp,
-                reflection_temp,
                 elo_k_factor,
                 top_k_hypotheses,
             ],
@@ -1057,25 +1114,12 @@ def create_gradio_interface():
             outputs=[delete_history_status, history_output, delete_run_dropdown],
         )
 
-        # Example inputs
-        gr.Examples(
-            examples=[
-                ["Develop new methods for increasing the efficiency of solar panels"],
-                ["Create novel approaches to treat Alzheimer's disease"],
-                ["Design sustainable materials for construction"],
-                ["Improve machine learning model interpretability"],
-                ["Develop new quantum computing algorithms"],
-            ],
-            inputs=[research_goal_input],
-            label="Example Research Goals",
-        )
-
         # GitHub icon and link at the bottom
         gr.HTML(
             """
-            <div style="text-align:center; margin-top: 30px;">
-                <a href="https://github.com/chunhualiao/ai-co-scientist" target="_blank" style="text-decoration:none; display:inline-flex; align-items:center; gap:8px;">
-                    <svg height="32" width="32" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle;">
+            <div id="footer">
+                <a href="https://github.com/chunhualiao/ai-co-scientist" target="_blank" style="display:inline-flex; align-items:center; gap:8px;">
+                    <svg height="18" width="18" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle;">
                         <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
                         0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52
                         -.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2
@@ -1084,7 +1128,7 @@ def create_gradio_interface():
                         2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01
                         1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/>
                     </svg>
-                    <span style="font-size: 1.1em; vertical-align:middle;">View on GitHub</span>
+                    <span>View on GitHub</span>
                 </a>
             </div>
             """
@@ -1112,4 +1156,6 @@ if __name__ == "__main__":
         share=False,
         show_error=True,
         allowed_paths=[str(reports_dir.resolve())],
+        theme=app_theme(),
+        css=APP_CSS,
     )

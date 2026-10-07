@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Charts in the results panel and the saved HTML report: Elo rating across
+  cycles, a hypothesis family tree (parents → evolved children, colored by
+  operator), a review-score heatmap, and a similarity graph. They are inline SVG,
+  so no plotting dependency is needed. Hypotheses now record `elo_history`.
 - Reflection reviews are now grounded in a literature search per hypothesis
   (default sources: OpenAlex + arXiv; Semantic Scholar and PubMed are opt-in
   via `literature_search.sources`). Retrieved papers are shown to the reviewer
@@ -24,8 +28,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional environment variables: `LITERATURE_CONTACT_EMAIL`,
   `OPENALEX_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `NCBI_API_KEY`;
   `CO_SCIENTIST_DISABLE_LITERATURE=1` turns all lookups off.
+- Each run report is also saved as a PDF next to the HTML
+  (`results/reports/<run-id>.pdf`), printed with headless Chromium via
+  Playwright; skipped with a log line if Playwright/Chromium is missing, or
+  when `CO_SCIENTIST_DISABLE_PDF=1`. The history table links both.
 
 ### Fixed
+- `call_llm` no longer sends `temperature`, which reasoning models such as
+  `gpt-5-mini` reject unless it is 1. The UI temperature sliders were removed.
+- The UI was restyled (header card, side panel, examples next to the goal), and
+  result cards now use translucent colors that stay readable in dark mode.
+- arXiv searches require all significant query words (retrying with fewer
+  when nothing matches), and a preprint is merged with its journal version even
+  when their DOIs differ.
+- Literature searches use `search_keywords` that the generation/evolution
+  LLM returns with each hypothesis: 2-4 key phrases (field-standard terms, no
+  coined names), falling back to the title; title-word queries pulled in
+  off-topic papers. arXiv matches each phrase exactly, dropping the
+  least important phrases (down to two) when nothing matches.
+- LLM JSON with LaTeX written using single backslashes (`"$\sigma$"`, an
+  invalid JSON escape) is repaired and parsed instead of failing the step.
+- The reviewer lists which retrieved papers are actually relevant
+  (`relevant_papers`); only those are recorded as the literature the
+  hypothesis was checked against ("N relevant of M retrieved").
+- User references without a Crossref abstract get one from OpenAlex by DOI.
+- User notes are no longer listed as a hypothesis's cited references (they
+  still go into every prompt). Logs no longer print an unused temperature.
 - Clicking "Set Research Goal" again with the same goal and references no
   longer wipes the session, so later cycles (and evolution) actually run.
 

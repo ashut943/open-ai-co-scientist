@@ -289,10 +289,11 @@ def _attempt_model(
 
     for attempt in range(max_retries):
         try:
+            # temperature is not sent: reasoning models (gpt-5*, o-series) reject any
+            # value but the default, so every model runs at its provider default.
             completion = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
             )
             if completion.choices and len(completion.choices) > 0:
                 return completion.choices[0].message.content or ""

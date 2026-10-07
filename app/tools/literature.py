@@ -116,16 +116,38 @@ def _openalex_abstract(inverted) -> str:
     return " ".join(word for _, word in sorted(positioned))
 
 
-def search_openalex(query: str, max_results: int = 3, timeout: float = 10) -> List[Dict]:
-    params = {
-        "search": query,
-        "per_page": max_results,
-        "select": "id,doi,title,publication_year,primary_location,authorships,abstract_inverted_index",
-    }
+def _openalex_params(extra: Dict) -> Dict:
+    params = dict(extra)
     if os.getenv("OPENALEX_API_KEY"):
         params["api_key"] = os.getenv("OPENALEX_API_KEY")
     if _contact_email():
         params["mailto"] = _contact_email()
+    return params
+
+
+def openalex_abstract_for_doi(doi: str, timeout: float = 10) -> str:
+    """Abstract for a DOI from OpenAlex ('' if it has none). Crossref often lacks abstracts."""
+    try:
+        work = _get(
+            f"{OPENALEX_URL}/doi:{requests.utils.quote(doi, safe='/')}",
+            params=_openalex_params({"select": "abstract_inverted_index"}),
+            timeout=timeout,
+        ).json()
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return ""
+        raise
+    return _clean(_openalex_abstract(work.get("abstract_inverted_index")))
+
+
+def search_openalex(query: str, max_results: int = 3, timeout: float = 10) -> List[Dict]:
+    params = _openalex_params(
+        {
+            "search": _plain_query(query),
+            "per_page": max_results,
+            "select": "id,doi,title,publication_year,primary_location,authorships,abstract_inverted_index",
+        }
+    )
     data = _get(OPENALEX_URL, params=params, timeout=timeout).json()
     papers = []
     for work in data.get("results") or []:
@@ -152,7 +174,11 @@ def search_semantic_scholar(query: str, max_results: int = 3, timeout: float = 1
     headers = {}
     if os.getenv("SEMANTIC_SCHOLAR_API_KEY"):
         headers["x-api-key"] = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
-    params = {"query": query, "limit": max_results, "fields": "title,abstract,year,venue,authors,externalIds,url"}
+    params = {
+        "query": _plain_query(query),
+        "limit": max_results,
+        "fields": "title,abstract,year,venue,authors,externalIds,url",
+    }
     data = _get(SEMANTIC_SCHOLAR_URL, params=params, headers=headers, timeout=timeout).json()
     papers = []
     for item in data.get("data") or []:
@@ -262,12 +288,56 @@ def _from_arxiv_dict(item: Dict) -> Dict:
     )
 
 
+_STOPWORDS = set("a an and as at by for from in into is of on or the to under using via with without".split())
+_ARXIV_TERM_STEPS = (6, 3)  # all of the first 6 significant words, then retry with 3 if nothing matches
+
+
+def _arxiv_terms(query: str) -> List[str]:
+    words = re.findall(r"[A-Za-z][A-Za-z0-9]*", query or "")
+    return [w for w in words if len(w) > 1 and w.lower() not in _STOPWORDS]
+
+
+def _arxiv_query(query: str, max_terms: int = _ARXIV_TERM_STEPS[0]) -> str:
+    """AND the significant words; arXiv treats bare words as OR and returns off-topic hits."""
+    return " AND ".join(f"all:{w}" for w in _arxiv_terms(query)[:max_terms])
+
+
+def _quoted_phrases(query: str) -> List[str]:
+    return [p.strip() for p in re.findall(r'"([^"]+)"', query or "") if p.strip()]
+
+
+def _plain_query(query: str) -> str:
+    """Query text without phrase quotes, for relevance-ranked sources (OpenAlex, Semantic Scholar)."""
+    return " ".join((query or "").replace('"', " ").split())
+
+
+def _arxiv_queries(query: str) -> List[str]:
+    """Strict-to-loose arXiv queries. Quoted key phrases must each appear as a phrase; when
+    nothing matches, the least important (last) phrases are dropped, keeping at least two."""
+    phrases = _quoted_phrases(query)
+    if phrases:
+        queries = []
+        for count in range(len(phrases), min(len(phrases), 2) - 1, -1):
+            queries.append(" AND ".join(f'all:"{p}"' for p in phrases[:count]))
+        return queries
+    queries = []
+    for max_terms in _ARXIV_TERM_STEPS:
+        candidate = _arxiv_query(query, max_terms)
+        if candidate and candidate not in queries:
+            queries.append(candidate)
+    return queries
+
+
 def search_arxiv(query: str, max_results: int = 3, timeout: float = 10) -> List[Dict]:
     import arxiv
 
     tool = _get_arxiv_tool()
-    search = arxiv.Search(query=query, max_results=max_results)
-    return [_from_arxiv_dict(tool._format_paper(result)) for result in tool.client.results(search)]
+    for arxiv_query in _arxiv_queries(query):
+        search = arxiv.Search(query=arxiv_query, max_results=max_results)
+        papers = [_from_arxiv_dict(tool._format_paper(result)) for result in tool.client.results(search)]
+        if papers:
+            return papers
+    return []
 
 
 def fetch_arxiv(arxiv_id: str, timeout: float = 10) -> Optional[Dict]:
@@ -322,10 +392,12 @@ def _failure_message(source: str, error: Exception) -> str:
 # --- Searching ---
 
 
-def _dedupe_key(paper: Dict) -> str:
+def _dedupe_keys(paper: Dict) -> set:
+    # Title as well as DOI: a preprint and its journal version carry different DOIs.
+    keys = {"title:" + re.sub(r"[^a-z0-9]", "", paper.get("title", "").lower())[:80]}
     if paper.get("doi"):
-        return "doi:" + paper["doi"].lower()
-    return "title:" + re.sub(r"[^a-z0-9]", "", paper.get("title", "").lower())[:80]
+        keys.add("doi:" + paper["doi"].lower())
+    return keys
 
 
 def _interleave(results: List[List[Dict]], limit: int) -> List[Dict]:
@@ -334,9 +406,9 @@ def _interleave(results: List[List[Dict]], limit: int) -> List[Dict]:
         for papers in results:
             if rank < len(papers):
                 paper = papers[rank]
-                key = _dedupe_key(paper)
-                if paper.get("title") and key not in seen:
-                    seen.add(key)
+                keys = _dedupe_keys(paper)
+                if paper.get("title") and not keys & seen:
+                    seen |= keys
                     merged.append(paper)
     return merged[:limit]
 
@@ -435,6 +507,11 @@ def resolve_references(lines: List[str]) -> Tuple[List[Dict], List[str]]:
                     errors.append(f"Could not resolve reference {label} ({line}): no record found")
             except Exception as e:  # noqa: BLE001
                 errors.append(f"Could not resolve reference {label} ({line}): {redact_secrets(str(e))}")
+        if paper and not paper.get("abstract") and paper.get("doi"):
+            try:
+                paper["abstract"] = openalex_abstract_for_doi(paper["doi"], timeout=timeout)
+            except Exception as e:  # noqa: BLE001 - a missing abstract is not worth an error
+                logger.info("No OpenAlex abstract for %s: %s", paper["doi"], redact_secrets(str(e)))
         if paper:
             resolved.append({**paper, "label": label, "kind": "paper", "raw": line})
         else:
@@ -493,7 +570,8 @@ def ground_references(
 
     Accepts [P#] labels (retrieved papers), [U#] labels (user references), and
     DOIs that match a known paper or that `verify_doi` confirms exists.
-    Returns (citations, number dropped).
+    Citations of user notes are skipped (notes guide the prompt; they are not
+    references) without counting as dropped. Returns (citations, number dropped).
     """
     known_dois = {}
     for paper in list(retrieved) + list(user_references):
@@ -519,7 +597,9 @@ def ground_references(
         if paper is None:
             dropped += 1
             continue
-        rendered = citation(paper) if paper.get("title") or paper.get("kind") == "note" else f"doi:{paper['doi']}"
+        if paper.get("kind") == "note":
+            continue
+        rendered = citation(paper) if paper.get("title") else f"doi:{paper['doi']}"
         if rendered not in kept:
             kept.append(rendered)
     return kept, dropped

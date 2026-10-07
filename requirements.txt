@@ -10,3 +10,4 @@ numpy==2.5.0
 arxiv==4.0.0  # arXiv API integration
 feedparser==6.0.12  # For arXiv RSS feeds
 python-dateutil==2.9.0.post0  # Date handling for literature search
+playwright  # Optional: PDF copies of reports (also run `playwright install chromium`)

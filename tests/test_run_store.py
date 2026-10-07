@@ -1,7 +1,20 @@
 import json
+import sys
+import types
+from pathlib import Path
 
 from app.models import ResearchGoal
-from app.run_store import delete_run, history_html, list_runs, render_report, report_file_url, save_run, write_report
+from app.run_store import (
+    delete_run,
+    history_html,
+    list_runs,
+    pdf_report_path,
+    render_report,
+    report_file_url,
+    save_run,
+    write_pdf_report,
+    write_report,
+)
 
 FAKE_KEY = "sk-parley-THIS-FAKE-KEY-MUST-NOT-PERSIST"
 
@@ -144,3 +157,93 @@ def test_report_file_url_uses_gradio_file_endpoint(tmp_path):
     report_path = tmp_path / "reports" / "run with spaces.html"
     assert report_file_url(report_path).startswith("/gradio_api/file=")
     assert "run%20with%20spaces.html" in report_file_url(report_path)
+
+
+class _FakePlaywright:
+    """Stands in for playwright.sync_api; 'prints' the page URL into the PDF file."""
+
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.chromium = self
+        self.goto_url = None
+
+    def __call__(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def launch(self):
+        if self.fail:
+            raise RuntimeError("Executable doesn't exist; run playwright install chromium")
+        return self
+
+    def new_page(self):
+        return self
+
+    def goto(self, url):
+        self.goto_url = url
+
+    def pdf(self, path, **kwargs):
+        Path(path).write_bytes(b"%PDF-1.4 " + self.goto_url.encode())
+
+    def close(self):
+        pass
+
+
+def _install_fake_playwright(monkeypatch, fake):
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = fake
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+
+def _saved_run(run_id):
+    return save_run(
+        research_goal=ResearchGoal(description="PDF me"),
+        cycle_details=_cycle_details(),
+        status="done",
+        references_html="<p>refs</p>",
+        results_html="<p>results</p>",
+        run_id=run_id,
+    )
+
+
+def test_write_report_also_prints_a_pdf_next_to_the_html(tmp_path, monkeypatch):
+    monkeypatch.setenv("CO_SCIENTIST_RUNS_DIR", str(tmp_path))
+    monkeypatch.delenv("CO_SCIENTIST_DISABLE_PDF")
+    _install_fake_playwright(monkeypatch, _FakePlaywright())
+
+    report_path = write_report(_saved_run("run-pdf"))
+
+    pdf_path = pdf_report_path(report_path)
+    assert pdf_path == tmp_path / "reports" / "run-pdf.pdf"
+    assert pdf_path.read_bytes().startswith(b"%PDF")
+    assert report_path.resolve().as_uri().encode() in pdf_path.read_bytes()
+    assert "run-pdf.pdf" in history_html()
+    assert delete_run("run-pdf") is True
+    assert not pdf_path.exists()
+
+
+def test_pdf_failure_keeps_the_html_report(tmp_path, monkeypatch):
+    monkeypatch.setenv("CO_SCIENTIST_RUNS_DIR", str(tmp_path))
+    monkeypatch.delenv("CO_SCIENTIST_DISABLE_PDF")
+    _install_fake_playwright(monkeypatch, _FakePlaywright(fail=True))
+
+    report_path = write_report(_saved_run("run-nopdf"))
+
+    assert report_path.exists()
+    assert pdf_report_path(report_path) is None
+    assert write_pdf_report(report_path) is None
+
+
+def test_pdf_is_skipped_when_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("CO_SCIENTIST_RUNS_DIR", str(tmp_path))
+    _install_fake_playwright(monkeypatch, _FakePlaywright())
+
+    report_path = write_report(_saved_run("run-disabled"))
+
+    assert pdf_report_path(report_path) is None

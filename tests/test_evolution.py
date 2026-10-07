@@ -80,16 +80,25 @@ def test_evolve_hypothesis_creates_child_with_parent_ids_without_mutating_parent
     parent = _hypo("G1", "Parent", "Original parent text.")
     original_text = parent.text
     context.add_hypothesis(parent)
-    payload = json.dumps({"title": "Child", "text": "Evolved child text.", "reasoning": "Clearer mechanism."})
+    payload = json.dumps(
+        {
+            "title": "Child",
+            "text": "Evolved child text.",
+            "reasoning": "Clearer mechanism.",
+            "search_keywords": ["perovskite tandem", "interface passivation"],
+        }
+    )
 
-    with patch("app.agents.call_llm", return_value=payload):
+    with patch("app.agents.call_llm", return_value=payload) as mock_call:
         child = evolve_hypothesis("MUTATE", [parent], goal, context)
 
+    assert "search_keywords" in mock_call.call_args.args[0]
     assert child is not None
     assert child.hypothesis_id != parent.hypothesis_id
     assert child.parent_ids == ["G1"]
     assert child.evolution_operator == "MUTATE"
     assert child.text == "Evolved child text."
+    assert child.search_keywords == '"perovskite tandem" "interface passivation"'
     assert parent.text == original_text  # no in-place mutation
     assert any("[MUTATE]" in c for c in child.review_comments)
 

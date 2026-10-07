@@ -43,13 +43,16 @@ class Hypothesis:
         self.safety_ethical_concerns: List[str] = []
         self.recommended_improvements: List[str] = []
         self.elo_score: float = 1200.0  # initial Elo score
+        self.elo_history: List[List[float]] = []  # [cycle, elo] after each tournament it played
         self.review_comments: List[str] = []
         self.references: List[str] = []
         self.is_active: bool = True
         self.parent_ids: List[str] = []  # Store IDs of parent hypotheses
         self.evolution_operator: Optional[str] = None  # REFINE|MUTATE|HYBRIDIZE|SIMPLIFY
-        self.literature: List[Dict] = []  # papers retrieved for this hypothesis's review
+        self.literature: List[Dict] = []  # retrieved papers the reviewer judged relevant
+        self.literature_retrieved: int = 0  # how many papers the search returned before that judgment
         self.closest_prior_work: List[str] = []  # reviewer's novelty comparison to that literature
+        self.search_keywords: str = ""  # LLM-suggested literature query; title is the fallback
 
     def to_dict(self) -> dict:
         return {
@@ -66,13 +69,16 @@ class Hypothesis:
             "safety_ethical_concerns": self.safety_ethical_concerns,
             "recommended_improvements": self.recommended_improvements,
             "elo_score": self.elo_score,
+            "elo_history": [list(point) for point in self.elo_history],
             "review_comments": self.review_comments,
             "references": self.references,
             "is_active": self.is_active,
             "parent_ids": self.parent_ids,
             "evolution_operator": self.evolution_operator,
             "literature": self.literature,
+            "literature_retrieved": self.literature_retrieved,
             "closest_prior_work": self.closest_prior_work,
+            "search_keywords": self.search_keywords,
         }
 
 

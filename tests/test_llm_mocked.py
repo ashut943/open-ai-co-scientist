@@ -93,7 +93,7 @@ def test_openai_provider_uses_openai_key_endpoint_and_model(monkeypatch):
     assert response == "response"
     assert mock_openai.call_args.kwargs["api_key"] == "fake-openai-key"
     assert mock_openai.call_args.kwargs["base_url"] == PARLEY_BASE_URL
-    assert mock_openai.return_value.chat.completions.create.call_args.kwargs["model"] == "gpt-5-mini"
+    assert mock_openai.return_value.chat.completions.create.call_args.kwargs["model"] == utils.config["openai_model"]
 
 
 def test_openai_provider_requires_openai_key(monkeypatch):

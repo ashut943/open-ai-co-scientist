@@ -84,7 +84,7 @@ In accordance with LLNL policy on Generative Artificial Intelligence, this proje
 
 1. **Enter a research goal** in the provided textbox.
    Optionally add **references and notes**, one per line: a DOI, an arXiv ID/URL, a PubMed ID/URL, or free text (e.g. "our pilot showed a 3% gain").
-2. **(Optional) Adjust advanced settings** such as LLM model, number of hypotheses, temperatures, etc.
+2. **(Optional) Adjust advanced settings** such as LLM model, number of hypotheses, and Elo K-factor. Temperature is not sent: every model runs at its provider default, since reasoning models such as `gpt-5-mini` reject other values.
 3. **Click "Run Cycle"** to generate, review, and evolve hypotheses.
 4. **View results, meta-review, and related literature** in the web interface.
 5. **Iterate** by running additional cycles to refine hypotheses.
@@ -106,7 +106,7 @@ The system uses a multi-agent approach:
 
 ## 📚 Literature Integration
 
-- **Grounded reviews:** before reviewing a hypothesis, the Reflection Agent searches the sources in `literature_search.sources` (default `openalex` and `arxiv`; `semantic_scholar` and `pubmed` are also available) in parallel. The top papers (`max_papers_in_prompt`, default 6) are shown to the reviewer as `[P1]`, `[P2]`, ... Novelty is judged against them, and the closest prior work is recorded.
+- **Grounded reviews:** before reviewing a hypothesis, the Reflection Agent searches (using the hypothesis's LLM-suggested `search_keywords`, or its title) the sources in `literature_search.sources` (default `openalex` and `arxiv`; `semantic_scholar` and `pubmed` are also available) in parallel. The top papers (`max_papers_in_prompt`, default 6) are shown to the reviewer as `[P1]`, `[P2]`, ... Novelty is judged against them, and the closest prior work is recorded.
 - **Your references:** lines from the "References and notes" box are resolved once per goal (Crossref for DOIs, arXiv, PubMed) and passed to the generation, reflection and evolution prompts as `[U1]`, `[U2]`, ... Lines that are not identifiers are kept as notes.
 - **No invented citations:** a cited reference is kept only if it maps to a `[P#]` or `[U#]` paper, or to a DOI that Crossref confirms exists. Anything else is dropped, and the drop is noted in the review.
 - **References tab:** shows your references, the papers each review was checked against, and related papers for the goal.

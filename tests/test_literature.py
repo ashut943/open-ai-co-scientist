@@ -160,6 +160,30 @@ def test_search_merges_sources_and_reports_failures_without_leaking_keys(enabled
     assert classify_llm_error(errors[0]) == "Literature search unavailable"
 
 
+def test_search_drops_preprint_duplicate_of_journal_paper(enabled, monkeypatch):
+    title = "Quantum thermodynamic uncertainty relation under feedback control"
+    monkeypatch.setitem(
+        lit.SOURCES, "journal", lambda q, n, t: [lit._paper("openalex", "W1", title, doi="10.1103/PhysRevE.1")]
+    )
+    monkeypatch.setitem(
+        lit.SOURCES,
+        "preprint",
+        lambda q, n, t: [lit._paper("arxiv", "2301.1", title + ".", doi="10.48550/arXiv.2301.1")],
+    )
+
+    papers, errors = lit.LiteratureSearch(sources=["journal", "preprint"]).search("tur feedback")
+
+    assert errors == []
+    assert [p["source"] for p in papers] == ["openalex"]
+
+
+def test_arxiv_query_requires_all_significant_words():
+    assert lit._arxiv_query("Thermodynamic uncertainty relation under feedback-control") == (
+        "all:Thermodynamic AND all:uncertainty AND all:relation AND all:feedback AND all:control"
+    )
+    assert lit._arxiv_query("of the") == ""
+
+
 def test_search_is_skipped_when_disabled():
     with patch.object(lit, "search_openalex", side_effect=AssertionError("network used")):
         assert lit.LiteratureSearch(sources=["openalex"]).search("anything") == ([], [])
@@ -240,12 +264,8 @@ def test_ground_references_keeps_only_verifiable_citations():
         verify_doi=lambda doi: doi == "10.2000/real",
     )
 
-    assert kept == [
-        lit.citation(retrieved[1]),
-        "Note: Pilot data",
-        lit.citation(retrieved[0]),
-        "doi:10.2000/real",
-    ]
+    # The user's note guides prompts but is not a reference, and is not counted as dropped.
+    assert kept == [lit.citation(retrieved[1]), lit.citation(retrieved[0]), "doi:10.2000/real"]
     assert dropped == 2
 
 
@@ -260,6 +280,110 @@ def test_user_references_reach_generation_prompt():
         GenerationAgent().generate_new_hypotheses(goal, ContextMemory())
 
     assert "[U1] Note from the user: Pilot showed a 3% gain" in mock_call.call_args.args[0]
+
+
+def test_generation_asks_for_and_keeps_search_keywords():
+    goal = ResearchGoal("Goal", num_hypotheses=1)
+    reply = '[{"title": "IKUR", "text": "t", "search_keywords": "uncertainty relation, feedback,  Markov jump"}]'
+
+    with patch("app.agents.call_llm", return_value=reply) as mock_call:
+        hypotheses, errors = GenerationAgent().generate_new_hypotheses(goal, ContextMemory())
+
+    assert "search_keywords" in mock_call.call_args.args[0]
+    assert errors == []
+    assert hypotheses[0].search_keywords == '"uncertainty relation" "feedback" "Markov jump"'
+
+
+class _FakeArxivTool:
+    def __init__(self, results_for):
+        self.results_for, self.queries = results_for, []
+        self.client = self
+
+    def results(self, search):
+        self.queries.append(search.query)
+        return self.results_for(search.query)
+
+    def _format_paper(self, item):
+        return item
+
+
+def test_arxiv_retries_with_fewer_terms_when_strict_query_is_empty(monkeypatch):
+    paper = {"arxiv_id": "2401.1", "title": "Feedback TUR", "published": "2024-01-01"}
+    tool = _FakeArxivTool(lambda q: [] if q.count("AND") >= 3 else [paper])
+    monkeypatch.setattr(lit, "_get_arxiv_tool", lambda: tool)
+
+    papers = lit.search_arxiv("hybrid informational kinetic uncertainty relation feedback motors", 3)
+
+    assert [p["title"] for p in papers] == ["Feedback TUR"]
+    assert tool.queries == [
+        "all:hybrid AND all:informational AND all:kinetic AND all:uncertainty AND all:relation AND all:feedback",
+        "all:hybrid AND all:informational AND all:kinetic",
+    ]
+
+
+def test_arxiv_searches_key_phrases_and_drops_the_last_ones_first(monkeypatch):
+    paper = {"arxiv_id": "2401.2", "title": "Activity bounds", "published": "2024-01-01"}
+    tool = _FakeArxivTool(lambda q: [] if "Markov" in q else [paper])
+    monkeypatch.setattr(lit, "_get_arxiv_tool", lambda: tool)
+
+    papers = lit.search_arxiv('"dynamical activity" "transfer entropy" "Markov jump process"', 3)
+
+    assert [p["title"] for p in papers] == ["Activity bounds"]
+    assert tool.queries == [
+        'all:"dynamical activity" AND all:"transfer entropy" AND all:"Markov jump process"',
+        'all:"dynamical activity" AND all:"transfer entropy"',
+    ]
+
+
+def test_arxiv_never_loosens_below_two_phrases(monkeypatch):
+    tool = _FakeArxivTool(lambda q: [])
+    monkeypatch.setattr(lit, "_get_arxiv_tool", lambda: tool)
+
+    assert lit.search_arxiv('"dynamical activity" "transfer entropy"', 3) == []
+    assert tool.queries == ['all:"dynamical activity" AND all:"transfer entropy"']
+
+
+@responses.activate
+def test_relevance_ranked_sources_get_the_phrases_without_quotes(enabled):
+    responses.add(responses.GET, lit.OPENALEX_URL, json={"results": []})
+
+    lit.search_openalex('"dynamical activity" "transfer entropy"', 3)
+
+    assert "search=dynamical+activity+transfer+entropy" in responses.calls[0].request.url
+
+
+def test_arxiv_query_drops_numbers_and_single_letters():
+    assert (
+        lit._arxiv_query("Level-2.5 large deviation bound") == "all:Level AND all:large AND all:deviation AND all:bound"
+    )
+
+
+@responses.activate
+def test_missing_crossref_abstract_is_filled_from_openalex(enabled):
+    work = {"message": {**CROSSREF_WORK["message"], "abstract": None}}
+    responses.add(responses.GET, lit.CROSSREF_URL + "10.1038/nature12373", json=work)
+    responses.add(
+        responses.GET,
+        lit.OPENALEX_URL + "/doi:10.1038/nature12373",
+        json={"abstract_inverted_index": {"Thermometry": [0], "works": [1]}},
+    )
+
+    refs, errors = lit.resolve_references(["10.1038/nature12373"])
+
+    assert errors == []
+    assert refs[0]["abstract"] == "Thermometry works"
+
+
+@responses.activate
+def test_openalex_abstract_lookup_failure_does_not_fail_the_reference(enabled):
+    work = {"message": {**CROSSREF_WORK["message"], "abstract": None}}
+    responses.add(responses.GET, lit.CROSSREF_URL + "10.1038/nature12373", json=work)
+    responses.add(responses.GET, lit.OPENALEX_URL + "/doi:10.1038/nature12373", status=500)
+
+    refs, errors = lit.resolve_references(["10.1038/nature12373"])
+
+    assert errors == []
+    assert refs[0]["kind"] == "paper" and refs[0]["abstract"] == ""
 
 
 def test_run_cycle_resolves_user_references_once():

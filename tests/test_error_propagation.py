@@ -10,6 +10,7 @@ import pytest
 import app.utils as utils
 from app.agents import GenerationAgent, SupervisorAgent
 from app.models import ContextMemory, ResearchGoal
+from app.plots import cycle_plots_html
 from app.utils import classify_llm_error
 
 # --- classifier unit tests (the four required categories + fallback) ---
@@ -131,6 +132,19 @@ def test_run_cycle_no_errors_key_on_success():
     for details in _run_two_cycles(_step_llm()):
         assert "errors" not in details or not details["errors"]
         assert details["steps"]["generation"]["hypotheses"]
+
+
+def test_two_cycles_record_elo_history_and_feed_the_charts():
+    first, second = _run_two_cycles(_step_llm())
+
+    pool = second["steps"]["ranking"]["hypotheses"]
+    survivors = [h for h in pool if len(h["elo_history"]) == 2]
+    assert survivors and [c for c, _ in survivors[0]["elo_history"]] == [1, 2]
+    assert any(h["parent_ids"] for h in pool)
+    charts = cycle_plots_html(second)
+    assert "Elo rating across cycles" in charts
+    assert "Hypothesis family tree" in charts
+    assert "Hypothesis family tree" not in cycle_plots_html(first)
 
 
 @pytest.mark.parametrize(

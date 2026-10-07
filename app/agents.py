@@ -1,6 +1,7 @@
 import json
 import math
 import random
+import re
 from typing import Dict, List, Tuple
 
 # Import necessary components from other modules
@@ -26,20 +27,56 @@ from .utils import (
 # --- Agent-Specific LLM Calls (Moved from main.py/utils.py for better cohesion) ---
 
 
+_SEARCH_KEYWORDS_INSTRUCTION = (
+    "a JSON list of 2-4 key phrases (1-3 words each) that a relevant paper must contain, most "
+    'important first, e.g. ["thermodynamic uncertainty relation", "feedback control", "Markov jump process"]. '
+    "Use field-standard vocabulary; no names coined in the hypothesis, no numbers or formulas."
+)
+_MAX_SEARCH_PHRASES = 4
+
+
+def _clean_search_keywords(value) -> str:
+    """Normalize the model's key phrases (list, or comma/semicolon string) to a quoted-phrase query.
+
+    e.g. ["dynamical activity", "transfer entropy"] -> '"dynamical activity" "transfer entropy"'.
+    Quotes let the arXiv search match phrases instead of loose words.
+    """
+    if isinstance(value, str):
+        value = re.split(r"[;,]", value)
+    if not isinstance(value, list):
+        return ""
+    phrases = []
+    for item in value:
+        phrase = " ".join(re.sub(r"[\"()]", " ", str(item)).split()[:4])
+        if phrase and phrase.lower() not in {p.lower() for p in phrases}:
+            phrases.append(phrase)
+    return " ".join(f'"{p}"' for p in phrases[:_MAX_SEARCH_PHRASES])
+
+
+# Group 1 is set for a valid JSON escape; \b \f \n \r \t followed by a letter are LaTeX (\frac, \nabla, \tau).
+_JSON_ESCAPE = re.compile(r'\\(["\\/]|u[0-9a-fA-F]{4}|[bfnrt](?![A-Za-z]))?')
+
+
+def _loads_llm_json(text: str):
+    """json.loads that tolerates LaTeX written with single backslashes (e.g. "\\sigma") inside strings."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        if "Invalid \\escape" not in e.msg:
+            raise
+        return json.loads(_JSON_ESCAPE.sub(lambda m: m.group(0) if m.group(1) else "\\\\", text))
+
+
 # Updated signature to accept temperature
 def call_llm_for_generation(
     prompt: str, num_hypotheses: int = 3, temperature: float = 0.7, model: str | None = None
 ) -> List[Dict]:
     """Calls LLM for generating hypotheses, handling JSON parsing."""
-    logger.info(
-        "LLM generation called with prompt: %s, num_hypotheses: %d, temperature: %.2f",
-        prompt,
-        num_hypotheses,
-        temperature,
-    )
+    logger.info("LLM generation called with prompt: %s, num_hypotheses: %d", prompt, num_hypotheses)
     full_prompt = (
         prompt
-        + "\n\nPlease return the response as a JSON array of objects, where each object has a 'title' and 'text' key."
+        + "\n\nPlease return the response as a JSON array of objects, where each object has a 'title' and 'text' "
+        + f"key, plus a 'search_keywords' key: {_SEARCH_KEYWORDS_INSTRUCTION}"
     )
 
     # Pass the received temperature down to the actual LLM call
@@ -58,7 +95,7 @@ def call_llm_for_generation(
             response = response[:-3]
         response = response.strip()
 
-        hypotheses_data = json.loads(response)
+        hypotheses_data = _loads_llm_json(response)
 
         if not isinstance(hypotheses_data, list) or not all(
             isinstance(h, dict) and "title" in h and "text" in h for h in hypotheses_data
@@ -131,7 +168,7 @@ def call_llm_for_reflection(
     (labelled U1..Un) ground the novelty/feasibility judgment and are the only
     sources the reviewer may cite.
     """
-    logger.info("LLM reflection called with temperature: %.2f", temperature)
+    logger.info("LLM reflection called (model=%s, %d retrieved papers)", model, len(literature or []))
     goal_block = research_goal.strip() if research_goal else "Not provided."
     criteria = ", ".join(REVIEW_SCORE_KEYS)
     evidence = ""
@@ -148,7 +185,9 @@ def call_llm_for_reflection(
             "novelty must be 1-2 and closest_prior_work must say which paper and how it overlaps. Use them to "
             "judge feasibility (are the methods or materials already demonstrated?). Absence from these results "
             "does not prove novelty. In references, cite ONLY the labels above (e.g. 'P2', 'U1'); citations to "
-            "anything else are discarded.\n\n"
+            "anything else are discarded.\n"
+            "Search results can be off-topic: in relevant_papers list only the P labels of retrieved papers that "
+            "are actually about this hypothesis's subject, and ignore the others entirely.\n\n"
         )
     else:
         evidence = "No literature was retrieved for this review.\n\n"
@@ -176,7 +215,12 @@ def call_llm_for_reflection(
         f'  "recommended_improvements": list of strings,\n'
         f'  "closest_prior_work": list of strings, each "<label>: how it overlaps or differs",\n'
         f'  "comment": brief overall summary string,\n'
-        f'  "references": list of strings.\n'
+        f'  "references": list of strings'
+        + (
+            ',\n  "relevant_papers": list of P labels (e.g. ["P1", "P3"]); [] if none are relevant.\n'
+            if literature
+            else ".\n"
+        )
     )
     response = call_llm(prompt, temperature=temperature, model=model)
     logger.info("LLM reflection response for hypothesis: %s", response)
@@ -196,6 +240,7 @@ def call_llm_for_reflection(
         "closest_prior_work": [],
         "comment": "",
         "references": [],
+        "relevant_papers": None,  # None: the model did not judge relevance, so keep every retrieved paper
         "error": None,
     }
 
@@ -205,7 +250,7 @@ def call_llm_for_reflection(
         return review_data
 
     try:
-        parsed_data = json.loads(_strip_json_fences(response))
+        parsed_data = _loads_llm_json(_strip_json_fences(response))
         raw_scores = parsed_data.get("review_scores", {})
         if not isinstance(raw_scores, dict):
             raw_scores = {}
@@ -236,6 +281,8 @@ def call_llm_for_reflection(
         review_data["comment"] = comment if isinstance(comment, str) else str(comment)
         references = parsed_data.get("references", [])
         review_data["references"] = references if isinstance(references, list) else []
+        if "relevant_papers" in parsed_data:
+            review_data["relevant_papers"] = _coerce_str_list(parsed_data.get("relevant_papers"))
 
     except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as e:
         logger.warning("Error parsing LLM reflection response: %s", response, exc_info=True)
@@ -366,7 +413,7 @@ def judge_pair(
         }
 
     try:
-        parsed = json.loads(_strip_json_fences(response))
+        parsed = _loads_llm_json(_strip_json_fences(response))
         winner = str(parsed.get("winner", "")).upper().strip()
         if winner not in {"A", "B", "TIE"}:
             raise ValueError(f"Invalid winner value: {parsed.get('winner')!r}")
@@ -637,7 +684,8 @@ def call_llm_for_evolution(
         f"Return ONLY a JSON object with keys:\n"
         f'  "title": short title for the NEW child hypothesis,\n'
         f'  "text": full statement of the NEW child hypothesis,\n'
-        f'  "reasoning": brief note of what changed and why.\n'
+        f'  "reasoning": brief note of what changed and why,\n'
+        f'  "search_keywords": {_SEARCH_KEYWORDS_INSTRUCTION}\n'
         f"Do not modify the parents in place; invent a distinct child.\n"
     )
 
@@ -649,7 +697,7 @@ def call_llm_for_evolution(
         return {"title": "Error", "text": response, "reasoning": ""}
 
     try:
-        parsed = json.loads(_strip_json_fences(response))
+        parsed = _loads_llm_json(_strip_json_fences(response))
         title = parsed.get("title")
         text = parsed.get("text")
         if not isinstance(title, str) or not title.strip() or not isinstance(text, str) or not text.strip():
@@ -657,7 +705,12 @@ def call_llm_for_evolution(
         reasoning = parsed.get("reasoning", "")
         if not isinstance(reasoning, str):
             reasoning = str(reasoning)
-        return {"title": title.strip(), "text": text.strip(), "reasoning": reasoning.strip()}
+        return {
+            "title": title.strip(),
+            "text": text.strip(),
+            "reasoning": reasoning.strip(),
+            "search_keywords": _clean_search_keywords(parsed.get("search_keywords")),
+        }
     except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
         logger.warning("Could not parse evolution response: %s", response, exc_info=True)
         return {"title": "Error", "text": f"Could not parse LLM response: {e}", "reasoning": ""}
@@ -691,6 +744,7 @@ def evolve_hypothesis(
     child = Hypothesis(new_id, idea["title"], idea["text"])
     child.parent_ids = [p.hypothesis_id for p in parents]
     child.evolution_operator = operator
+    child.search_keywords = idea.get("search_keywords", "")
     if idea["reasoning"]:
         child.review_comments.append(f"[{operator}] {idea['reasoning']}")
     logger.info(
@@ -752,6 +806,7 @@ class GenerationAgent:
             while hypo_id in context.hypotheses:
                 hypo_id = generate_unique_id("G")
             h = Hypothesis(hypo_id, idea["title"], idea["text"])
+            h.search_keywords = _clean_search_keywords(idea.get("search_keywords"))
             logger.info("Generated hypothesis: %s", h.to_dict())
             new_hypos.append(h)
         return new_hypos, errors
@@ -760,6 +815,18 @@ class GenerationAgent:
 def _literature_summary(paper: Dict) -> Dict:
     keys = ("source", "title", "year", "venue", "authors", "doi", "url")
     return {key: paper.get(key) for key in keys}
+
+
+def _relevant_subset(papers: List[Dict], labels: List[str] | None) -> List[Dict]:
+    """Retrieved papers the reviewer marked relevant (P labels); all of them if it did not judge."""
+    if labels is None:
+        return papers
+    keep = set()
+    for label in labels:
+        match = re.match(r"\[?P(\d+)\]?", str(label).strip(), re.IGNORECASE)
+        if match and 1 <= int(match.group(1)) <= len(papers):
+            keep.add(int(match.group(1)) - 1)
+    return [paper for index, paper in enumerate(papers) if index in keep]
 
 
 def _summarize_literature_errors(errors: List[str]) -> List[str]:
@@ -792,7 +859,7 @@ class ReflectionAgent:
         literature_errors: List[str] = []
 
         for h in hypotheses:
-            papers, search_errors = self.literature.search(hypothesis_query(h.title, h.text))
+            papers, search_errors = self.literature.search(h.search_keywords or hypothesis_query(h.title, h.text))
             literature_errors.extend(search_errors)
             result = call_llm_for_reflection(
                 h.text,
@@ -818,7 +885,8 @@ class ReflectionAgent:
             h.safety_ethical_concerns = result.get("safety_ethical_concerns") or []
             h.recommended_improvements = result.get("recommended_improvements") or []
             h.closest_prior_work = result.get("closest_prior_work") or []
-            h.literature = [_literature_summary(p) for p in papers]
+            h.literature = [_literature_summary(p) for p in _relevant_subset(papers, result.get("relevant_papers"))]
+            h.literature_retrieved = len(papers)
             if result["comment"]:
                 h.review_comments.append(result["comment"])
             grounded, dropped = ground_references(result["references"], papers, user_refs, verify_doi=verify)
@@ -1236,7 +1304,7 @@ def call_llm_for_meta_review(
         return fallback
 
     try:
-        parsed = json.loads(_strip_json_fences(response))
+        parsed = _loads_llm_json(_strip_json_fences(response))
         if not isinstance(parsed, dict):
             raise ValueError("Meta-review response is not a JSON object")
         meta = _empty_meta_review()
@@ -1385,6 +1453,8 @@ class SupervisorAgent:
         # 3. Ranking (single tournament over evolved + new + surviving hypotheses)
         logger.info("Step 3: Ranking")
         errors += self.ranking_agent.run_tournament(active_hypos, context, research_goal)
+        for h in active_hypos:
+            h.elo_history.append([cycle_details["iteration"], round(h.elo_score, 1)])
         cycle_details["steps"]["ranking"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
 
         final_ranked_hypos = [h for h in active_hypos]
