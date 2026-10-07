@@ -19,6 +19,23 @@ DEFAULT_RESULTS_DIR = Path("results")
 RUNS_DIR_ENV = "CO_SCIENTIST_RUNS_DIR"
 DISABLE_PDF_ENV = "CO_SCIENTIST_DISABLE_PDF"
 
+KATEX_URL = "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist"
+# Renders the LaTeX that models write in hypotheses and reviews; without network the raw
+# TeX stays readable. data-math-ready tells the PDF printer rendering has finished.
+KATEX_OPTIONS_JS = (
+    "{delimiters:["
+    "{left:'$$',right:'$$',display:true},{left:'\\\\[',right:'\\\\]',display:true},"
+    "{left:'$',right:'$',display:false},{left:'\\\\(',right:'\\\\)',display:false}],"
+    "throwOnError:false,ignoredTags:['script','noscript','style','textarea','pre','code']}"
+)
+KATEX_HEAD = (
+    f'<link rel="stylesheet" href="{KATEX_URL}/katex.min.css">'
+    f'<script defer src="{KATEX_URL}/katex.min.js"></script>'
+    f'<script defer src="{KATEX_URL}/contrib/auto-render.min.js" onload="'
+    f"renderMathInElement(document.body,{KATEX_OPTIONS_JS});"
+    "document.body.dataset.mathReady='1'\"></script>"
+)
+
 SECRET_PATTERNS = [
     re.compile(r"sk-or-v1-[A-Za-z0-9_-]+"),
     re.compile(r"sk-proj-[A-Za-z0-9_-]+"),
@@ -179,6 +196,27 @@ def list_runs(limit: Optional[int] = 20) -> List[Dict[str, Any]]:
     return sorted_runs[:limit]
 
 
+def _token_usage_table(usage: Optional[Dict[str, Any]]) -> str:
+    if not usage or not usage.get("steps"):
+        return ""
+    rows = list(usage["steps"].items()) + [("This cycle", usage.get("total") or {})]
+    if usage.get("session_total"):
+        rows.append(("Session so far", usage["session_total"]))
+    body = "".join(
+        f"<tr><td>{_escape(name)}</td>"
+        + "".join(f"<td>{int(counts.get(field, 0)):,}</td>" for field in _USAGE_FIELDS)
+        + "</tr>"
+        for name, counts in rows
+    )
+    return (
+        "<table><tr><th>Step</th><th>Calls</th><th>Input tokens</th><th>Output tokens</th>"
+        f"<th>Reasoning tokens</th></tr>{body}</table>"
+    )
+
+
+_USAGE_FIELDS = ("calls", "input_tokens", "output_tokens", "reasoning_tokens")
+
+
 def render_report(run: Dict[str, Any]) -> str:
     goal = run.get("research_goal", {})
     cycle = run.get("cycle_details", {})
@@ -202,6 +240,7 @@ def render_report(run: Dict[str, Any]) -> str:
         "svg{max-width:100%;height:auto}",
         "@media print{body{margin:0}.hypothesis,svg,tr{break-inside:avoid}h2,h3{break-after:avoid}}",
         "</style>",
+        KATEX_HEAD,
         "</head>",
         "<body><main>",
         f"<h1>Research Run {_escape(run.get('run_id'))}</h1>",
@@ -223,6 +262,10 @@ def render_report(run: Dict[str, Any]) -> str:
     charts = cycle_plots_html(cycle)
     if charts:
         html_parts.append(f"</section><section><h2>Charts</h2>{charts}")
+
+    usage_table = _token_usage_table(cycle.get("token_usage"))
+    if usage_table:
+        html_parts.append(f"</section><section><h2>Token Usage</h2>{usage_table}")
 
     html_parts.append("</section><section><h2>Cycle Steps</h2>")
     for step_name, step_data in steps.items():
@@ -275,6 +318,11 @@ def write_pdf_report(report_path: Path) -> Optional[Path]:
             try:
                 page = browser.new_page()
                 page.goto(Path(report_path).resolve().as_uri())
+                try:
+                    page.wait_for_function("document.body.dataset.mathReady === '1'", timeout=15000)
+                    page.evaluate("document.fonts.ready.then(() => true)")
+                except Exception as e:
+                    logger.info("PDF report printed without rendered math: %s", redact_secrets(str(e)))
                 page.pdf(
                     path=str(pdf_path),
                     format="A4",
@@ -376,7 +424,7 @@ def _hypothesis_block(index: int, hypothesis: Dict[str, Any]) -> str:
         '<div class="hypothesis">'
         f"<h3>{index}. {_escape(hypothesis.get('title'), 'Untitled')}</h3>"
         f"<p><strong>ID:</strong> {_escape(hypothesis.get('id'))} | "
-        f"<strong>Elo:</strong> {_escape(hypothesis.get('elo_score'))}</p>"
+        f"<strong>Elo:</strong> {_escape(_round(hypothesis.get('elo_score')))}</p>"
         f"<p>{_escape(hypothesis.get('text'))}</p>"
         f"<p><strong>Novelty:</strong> {_escape(hypothesis.get('novelty_review'))} | "
         f"<strong>Feasibility:</strong> {_escape(hypothesis.get('feasibility_review'))}</p>"
@@ -385,6 +433,10 @@ def _hypothesis_block(index: int, hypothesis: Dict[str, Any]) -> str:
         f"<ul>{comments_html}</ul>"
         "</div>"
     )
+
+
+def _round(value: Any) -> Any:
+    return round(value, 1) if isinstance(value, float) else value
 
 
 def _escape(value: Any, default: str = "") -> str:

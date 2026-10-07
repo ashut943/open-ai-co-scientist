@@ -26,6 +26,16 @@ num_hypotheses: 4
 # over a minute before answering a generation prompt, so 30s was too short.
 llm_request_timeout_seconds: 180
 
+# Max LLM calls in flight at once for reflection reviews and tournament judging
+# (they are independent). Lower it if the provider returns rate-limit errors;
+# 1 runs them one at a time.
+llm_max_concurrency: 4
+
+# USD per 1M tokens as [input, output], used for the cost estimate shown after
+# each cycle (list prices; models not listed show token counts only).
+token_prices_per_million:
+  gemini-3.8-flash: [0.75, 3.75]
+
 # Elo K-factor
 elo_k_factor: 32
 
@@ -41,8 +51,8 @@ tournament_matches_per_hypothesis: 3
 literature_search:
   enabled: true
   sources: ["openalex", "arxiv"]
-  results_per_source: 3
-  max_papers_in_prompt: 6
+  results_per_source: 5
+  max_papers_in_prompt: 8
   timeout_seconds: 10
   verify_cited_dois: true
 

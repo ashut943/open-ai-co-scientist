@@ -68,6 +68,16 @@ def test_reflection_tolerates_single_backslash_latex():
     assert review["review_weaknesses"] == ["Bound $2/\\dot{\\sigma}_X$ uses \\frac and \\nabla; ok \\alpha\n next"]
 
 
+def test_reflection_tolerates_raw_newlines_inside_strings():
+    payload = _rich_payload(review_weaknesses=["WEAK"]).replace('"WEAK"', '"Line one\nline two\twith a tab"')
+
+    with patch("app.agents.call_llm", return_value=payload):
+        review = call_llm_for_reflection("Hypothesis", model="m", research_goal="Goal")
+
+    assert review["error"] is None
+    assert review["review_weaknesses"] == ["Line one\nline two\twith a tab"]
+
+
 def test_reflection_handles_fenced_json():
     payload = "```json\n" + _rich_payload() + "\n```"
     with patch("app.agents.call_llm", return_value=payload):

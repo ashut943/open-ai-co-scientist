@@ -3,7 +3,10 @@ import logging
 import os
 import random
 import re
+import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -269,6 +272,74 @@ def _is_timeout(error_str: str) -> bool:
     return "timeout" in low or "timed out" in low or "read timed out" in low
 
 
+class TokenUsage:
+    """Thread-safe token counts per pipeline step, from the provider's `usage` field."""
+
+    FIELDS = ("calls", "input_tokens", "output_tokens", "reasoning_tokens")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.steps: Dict[str, Dict[str, int]] = {}
+
+    def add(self, step: str, input_tokens: int, output_tokens: int, reasoning_tokens: int) -> None:
+        with self._lock:
+            counts = self.steps.setdefault(step, dict.fromkeys(self.FIELDS, 0))
+            counts["calls"] += 1
+            counts["input_tokens"] += input_tokens
+            counts["output_tokens"] += output_tokens
+            counts["reasoning_tokens"] += reasoning_tokens
+
+    def to_dict(self) -> Dict:
+        with self._lock:
+            steps = {name: dict(counts) for name, counts in self.steps.items()}
+        total = {field: sum(counts[field] for counts in steps.values()) for field in self.FIELDS}
+        return {"steps": steps, "total": total}
+
+
+_usage_meter: ContextVar[Optional[TokenUsage]] = ContextVar("usage_meter", default=None)
+_usage_step: ContextVar[str] = ContextVar("usage_step", default="other")
+
+
+@contextmanager
+def track_usage(meter: TokenUsage):
+    """Count tokens of every LLM call made in this context (and in threads started via copy_context)."""
+    token = _usage_meter.set(meter)
+    try:
+        yield meter
+    finally:
+        _usage_meter.reset(token)
+
+
+@contextmanager
+def usage_step(name: str):
+    token = _usage_step.set(name)
+    try:
+        yield
+    finally:
+        _usage_step.reset(token)
+
+
+def _record_usage(completion) -> None:
+    meter, usage = _usage_meter.get(), getattr(completion, "usage", None)
+    if meter is None or usage is None:
+        return
+    details = getattr(usage, "completion_tokens_details", None)
+    meter.add(
+        _usage_step.get(),
+        int(getattr(usage, "prompt_tokens", 0) or 0),
+        int(getattr(usage, "completion_tokens", 0) or 0),
+        int(getattr(details, "reasoning_tokens", 0) or 0),
+    )
+
+
+def estimate_cost(usage_total: Dict, model: Optional[str]) -> Optional[float]:
+    """USD estimate from `token_prices_per_million` in config.yaml; None if the model has no price."""
+    prices = (config.get("token_prices_per_million") or {}).get(model or "")
+    if not prices or len(prices) != 2:
+        return None
+    return (usage_total.get("input_tokens", 0) * prices[0] + usage_total.get("output_tokens", 0) * prices[1]) / 1e6
+
+
 def _attempt_model(
     client: "OpenAI",
     model: str,
@@ -295,6 +366,7 @@ def _attempt_model(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
             )
+            _record_usage(completion)
             if completion.choices and len(completion.choices) > 0:
                 return completion.choices[0].message.content or ""
             else:

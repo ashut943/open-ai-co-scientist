@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Token counting: each cycle records input, output, and reasoning tokens per
+  step (generation, evolution, reflection, tournament, meta-review). The status
+  box shows totals for the cycle and the session, plus a cost estimate for
+  models listed under `token_prices_per_million` in `config.yaml`; the report
+  has a Token Usage table.
 - Charts in the results panel and the saved HTML report: Elo rating across
   cycles, a hypothesis family tree (parents → evolved children, colored by
   operator), a review-score heatmap, and a similarity graph. They are inline SVG,
@@ -32,8 +37,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`results/reports/<run-id>.pdf`), printed with headless Chromium via
   Playwright; skipped with a log line if Playwright/Chromium is missing, or
   when `CO_SCIENTIST_DISABLE_PDF=1`. The history table links both.
+  LaTeX in hypotheses and reviews (`$...$`, `$$...$$`, `\(...\)`, `\[...\]`)
+  is typeset with KaTeX (loaded from a CDN; raw TeX stays if offline), and
+  the PDF is printed after the math has rendered. The app's results panel
+  typesets LaTeX the same way each time it updates.
+- Literature search retrieves 5 papers per source (was 3), up to 8 per
+  review prompt.
 
 ### Fixed
+- The "Related papers for the research goal" search no longer sends the whole
+  goal text (OpenAlex answered 400 Bad Request). It searches the key phrases of
+  the top-ranked hypotheses, or the goal's first sentence when there are none.
 - `call_llm` no longer sends `temperature`, which reasoning models such as
   `gpt-5-mini` reject unless it is 1. The UI temperature sliders were removed.
 - The UI was restyled (header card, side panel, examples next to the goal), and
@@ -47,7 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   off-topic papers. arXiv matches each phrase exactly, dropping the
   least important phrases (down to two) when nothing matches.
 - LLM JSON with LaTeX written using single backslashes (`"$\sigma$"`, an
-  invalid JSON escape) is repaired and parsed instead of failing the step.
+  invalid JSON escape) is repaired and parsed instead of failing the step;
+  raw newlines or tabs inside JSON strings are accepted too.
 - The reviewer lists which retrieved papers are actually relevant
   (`relevant_papers`); only those are recorded as the literature the
   hypothesis was checked against ("N relevant of M retrieved").
@@ -58,6 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer wipes the session, so later cycles (and evolution) actually run.
 
 ### Changed
+- Reflection reviews (with their literature searches) and tournament judge
+  calls now run concurrently, up to `llm_max_concurrency` (default 4) at a
+  time. Elo is still updated in pair order after judging, so rankings follow
+  the same rules; arXiv searches still queue on one rate-limited client.
 - Failures after generation are no longer silent. If a reflection review,
   tournament judgment, meta-review, or evolution operator fails, the cause is
   added to `cycle_details["errors"]` and shown in the results error box and

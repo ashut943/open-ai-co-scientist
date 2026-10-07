@@ -132,6 +132,7 @@ class ContextMemory:
         self.hypotheses: Dict[str, Hypothesis] = {}  # key: hypothesis_id
         self.tournament_results: List[Dict] = []
         self.meta_review_feedback: List[Dict] = []
+        self.token_usage: List[Dict] = []  # per-cycle token totals, oldest first
         self.iteration_number: int = 0
 
     def add_hypothesis(self, hypothesis: Hypothesis):

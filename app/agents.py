@@ -1,8 +1,10 @@
+import contextvars
 import json
 import math
 import random
 import re
-from typing import Dict, List, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Dict, List, Tuple, TypeVar
 
 # Import necessary components from other modules
 from .config import config
@@ -17,14 +19,31 @@ from .tools.literature import (
     resolve_references,
 )
 from .utils import (
+    TokenUsage,
     call_llm,
     generate_unique_id,
     generate_visjs_data,
     logger,  # Use the logger configured in utils
     similarity_score,
+    track_usage,
+    usage_step,
 )
 
 # --- Agent-Specific LLM Calls (Moved from main.py/utils.py for better cohesion) ---
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+def _parallel_map(fn: Callable[[_T], _R], items: List[_T]) -> List[_R]:
+    """Run independent LLM calls up to `llm_max_concurrency` at a time; results keep input order."""
+    workers = min(len(items), max(1, int(config.get("llm_max_concurrency", 4) or 1)))
+    if workers <= 1:
+        return [fn(item) for item in items]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # Each task runs in a copy of the caller's context so token usage is attributed to its step.
+        futures = [pool.submit(contextvars.copy_context().run, fn, item) for item in items]
+        return [future.result() for future in futures]
 
 
 _SEARCH_KEYWORDS_INSTRUCTION = (
@@ -58,13 +77,14 @@ _JSON_ESCAPE = re.compile(r'\\(["\\/]|u[0-9a-fA-F]{4}|[bfnrt](?![A-Za-z]))?')
 
 
 def _loads_llm_json(text: str):
-    """json.loads that tolerates LaTeX written with single backslashes (e.g. "\\sigma") inside strings."""
+    """json.loads that tolerates what models often emit inside strings: raw newlines/tabs
+    and LaTeX written with single backslashes (e.g. "\\sigma")."""
     try:
-        return json.loads(text)
+        return json.loads(text, strict=False)
     except json.JSONDecodeError as e:
         if "Invalid \\escape" not in e.msg:
             raise
-        return json.loads(_JSON_ESCAPE.sub(lambda m: m.group(0) if m.group(1) else "\\\\", text))
+        return json.loads(_JSON_ESCAPE.sub(lambda m: m.group(0) if m.group(1) else "\\\\", text), strict=False)
 
 
 # Updated signature to accept temperature
@@ -858,9 +878,8 @@ class ReflectionAgent:
         failed: Dict[str, str] = {}
         literature_errors: List[str] = []
 
-        for h in hypotheses:
+        def review(h: Hypothesis):
             papers, search_errors = self.literature.search(h.search_keywords or hypothesis_query(h.title, h.text))
-            literature_errors.extend(search_errors)
             result = call_llm_for_reflection(
                 h.text,
                 temperature=reflect_temp,
@@ -869,6 +888,15 @@ class ReflectionAgent:
                 literature=papers,
                 user_references=user_refs,
             )
+            grounding = (
+                None
+                if result.get("error")
+                else ground_references(result["references"], papers, user_refs, verify_doi=verify)
+            )
+            return papers, search_errors, result, grounding
+
+        for h, (papers, search_errors, result, grounding) in zip(hypotheses, _parallel_map(review, hypotheses)):
+            literature_errors.extend(search_errors)
             if result.get("error"):
                 failed[h.hypothesis_id] = result["error"]
                 if not _has_review(h):
@@ -889,7 +917,7 @@ class ReflectionAgent:
             h.literature_retrieved = len(papers)
             if result["comment"]:
                 h.review_comments.append(result["comment"])
-            grounded, dropped = ground_references(result["references"], papers, user_refs, verify_doi=verify)
+            grounded, dropped = grounding
             for ref in grounded:
                 if ref not in h.references:
                     h.references.append(ref)
@@ -978,8 +1006,9 @@ class RankingAgent:
 
         logger.info(f"Running tournament with {len(pairs)} pairs.")
         judge_failures: List[str] = []
-        for hA, hB in pairs:
-            winner, judgment = run_pairwise_debate(hA, hB, research_goal=research_goal)
+        # The judge never sees Elo, so matches are judged concurrently and Elo is then updated in pair order.
+        verdicts = _parallel_map(lambda pair: run_pairwise_debate(*pair, research_goal=research_goal), pairs)
+        for (hA, hB), (winner, judgment) in zip(pairs, verdicts):
             if judgment.get("fallback_reason"):
                 judge_failures.append(judgment["fallback_reason"])
             result_record = {
@@ -1406,8 +1435,21 @@ class SupervisorAgent:
         Order: Generation (evolved children of the previous cycle's meta-review
         + fresh ideas) → Reflection → Tournament → Meta-review → Proximity.
         The meta-review at the end of a cycle steers the next cycle's evolution,
-        so the first cycle has no evolved children.
+        so the first cycle has no evolved children. Token usage per step is
+        recorded in cycle_details["token_usage"].
         """
+        meter = TokenUsage()
+        with track_usage(meter):
+            cycle_details = self._run_cycle_steps(research_goal, context)
+        usage = meter.to_dict()
+        context.token_usage.append(usage["total"])
+        usage["session_total"] = {
+            field: sum(cycle.get(field, 0) for cycle in context.token_usage) for field in TokenUsage.FIELDS
+        }
+        cycle_details["token_usage"] = usage
+        return cycle_details
+
+    def _run_cycle_steps(self, research_goal: ResearchGoal, context: ContextMemory) -> Dict:
         logger.info("--- Starting Cycle %d ---", context.iteration_number + 1)
         cycle_details = {"iteration": context.iteration_number + 1, "steps": {}, "meta_review": {}}
 
@@ -1425,7 +1467,8 @@ class SupervisorAgent:
         # candidates are ranked hypotheses, not unjudged new ones at default Elo.
         logger.info("Step 1: Generation (evolution + new hypotheses)")
         if context.meta_review_feedback:
-            evolved_hypotheses, evolution_errors = self.evolution_agent.evolve_hypotheses(context, research_goal)
+            with usage_step("evolution"):
+                evolved_hypotheses, evolution_errors = self.evolution_agent.evolve_hypotheses(context, research_goal)
             errors += evolution_errors
             for eh in evolved_hypotheses:
                 context.add_hypothesis(eh)
@@ -1436,7 +1479,8 @@ class SupervisorAgent:
                 "skipped_reason": "First cycle: evolution starts next cycle, guided by this cycle's meta-review.",
             }
 
-        new_hypotheses, generation_errors = self.generation_agent.generate_new_hypotheses(research_goal, context)
+        with usage_step("generation"):
+            new_hypotheses, generation_errors = self.generation_agent.generate_new_hypotheses(research_goal, context)
         errors += generation_errors
         for nh in new_hypotheses:
             context.add_hypothesis(nh)
@@ -1447,12 +1491,14 @@ class SupervisorAgent:
         # 2. Reflection (hypotheses with a successful prior review keep it)
         logger.info("Step 2: Reflection")
         unreviewed = [h for h in active_hypos if not _has_review(h)]
-        errors += self.reflection_agent.review_hypotheses(unreviewed, context, research_goal)
+        with usage_step("reflection"):
+            errors += self.reflection_agent.review_hypotheses(unreviewed, context, research_goal)
         cycle_details["steps"]["reflection"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
 
         # 3. Ranking (single tournament over evolved + new + surviving hypotheses)
         logger.info("Step 3: Ranking")
-        errors += self.ranking_agent.run_tournament(active_hypos, context, research_goal)
+        with usage_step("tournament"):
+            errors += self.ranking_agent.run_tournament(active_hypos, context, research_goal)
         for h in active_hypos:
             h.elo_history.append([cycle_details["iteration"], round(h.elo_score, 1)])
         cycle_details["steps"]["ranking"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
@@ -1462,7 +1508,10 @@ class SupervisorAgent:
 
         # 4. Meta-review (steers the next cycle's evolution)
         logger.info("Step 4: Meta-Review")
-        overview = self.meta_review_agent.summarize_and_feedback(context, adjacency=None, research_goal=research_goal)
+        with usage_step("meta_review"):
+            overview = self.meta_review_agent.summarize_and_feedback(
+                context, adjacency=None, research_goal=research_goal
+            )
         cycle_details["meta_review"] = overview
         cycle_details["steps"]["meta_review"] = overview
         if overview.get("fallback_reason"):

@@ -187,6 +187,12 @@ class _FakePlaywright:
     def goto(self, url):
         self.goto_url = url
 
+    def wait_for_function(self, expression, timeout):
+        self.waited_for = expression
+
+    def evaluate(self, expression):
+        return True
+
     def pdf(self, path, **kwargs):
         Path(path).write_bytes(b"%PDF-1.4 " + self.goto_url.encode())
 
@@ -247,3 +253,24 @@ def test_pdf_is_skipped_when_disabled(tmp_path, monkeypatch):
     report_path = write_report(_saved_run("run-disabled"))
 
     assert pdf_report_path(report_path) is None
+
+
+def test_report_typesets_latex_with_katex(tmp_path, monkeypatch):
+    monkeypatch.setenv("CO_SCIENTIST_RUNS_DIR", str(tmp_path))
+    details = _cycle_details()
+    details["steps"]["ranking2"]["hypotheses"][0]["text"] = r"Bound $\mathrm{Var}(J)/\langle J \rangle^2 \ge 2/\sigma$"
+
+    report = render_report(
+        save_run(
+            research_goal=ResearchGoal(description="Math"),
+            cycle_details=details,
+            status="done",
+            references_html="",
+            results_html="",
+            run_id="run-math",
+        )
+    )
+
+    assert "katex.min.js" in report and "renderMathInElement" in report
+    assert r"$\mathrm{Var}(J)/\langle J \rangle^2 \ge 2/\sigma$" in report
+    assert "Elo:</strong> 1220.5" in report

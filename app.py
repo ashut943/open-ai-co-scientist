@@ -1,6 +1,7 @@
 import html as html_lib
 import logging
 import os
+import re
 import threading
 import time
 from copy import deepcopy
@@ -16,6 +17,8 @@ from app.config import config
 from app.models import ContextMemory, ResearchGoal
 from app.plots import cycle_plots_html
 from app.run_store import (
+    KATEX_OPTIONS_JS,
+    KATEX_URL,
     delete_run,
     get_reports_dir,
     history_html,
@@ -25,9 +28,17 @@ from app.run_store import (
     save_run,
     write_report,
 )
-from app.tools.literature import LiteratureSearch, citation, literature_enabled, parse_reference_lines
+from app.tools.literature import (
+    LiteratureSearch,
+    citation,
+    hypothesis_query,
+    literature_enabled,
+    parse_reference_lines,
+    quoted_phrases,
+)
 from app.utils import (
     classify_llm_error,
+    estimate_cost,
     fetch_free_models,
     get_configured_model,
     get_deployment_environment,
@@ -326,7 +337,45 @@ def persist_cycle_result(research_goal: ResearchGoal, cycle_result: Dict[str, An
     )
     report_path = write_report(saved_run)
     status_msg = f"{cycle_result['status']}\nRun ID: {saved_run['run_id']}\n{report_lines(report_path)}"
+    usage_text = token_usage_lines(cycle_result["cycle_details"].get("token_usage"))
+    if usage_text:
+        status_msg += f"\n{usage_text}"
     return status_msg, cycle_result["results_html"], cycle_result["references_html"]
+
+
+def token_usage_lines(usage: Optional[Dict[str, Any]]) -> str:
+    """'Tokens this cycle: …' / 'Tokens this session: …' lines, with a cost estimate when priced."""
+    if not usage:
+        return ""
+    model = get_configured_model()
+    lines = []
+    for label, totals in (("this cycle", usage.get("total")), ("this session", usage.get("session_total"))):
+        if not totals:
+            continue
+        line = (
+            f"Tokens {label}: {totals.get('input_tokens', 0):,} in / {totals.get('output_tokens', 0):,} out"
+            f" ({totals.get('reasoning_tokens', 0):,} reasoning) over {totals.get('calls', 0)} calls"
+        )
+        cost = estimate_cost(totals, model)
+        if cost is not None:
+            line += f" ≈ ${cost:.2f}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def goal_search_query(goal_text: str, cycle_details: Dict[str, Any], max_phrases: int = 4) -> str:
+    """Short literature query for the goal: key phrases of the top-ranked hypotheses, else the
+    goal's first sentence (search APIs reject multi-paragraph queries)."""
+    ranked = (cycle_details.get("steps", {}).get("ranking") or {}).get("hypotheses") or []
+    phrases: List[str] = []
+    for hypo in sorted(ranked, key=lambda h: h.get("elo_score") or 0, reverse=True)[:3]:
+        for phrase in quoted_phrases(hypo.get("search_keywords") or ""):
+            if phrase.lower() not in {p.lower() for p in phrases}:
+                phrases.append(phrase)
+    if phrases:
+        return " ".join(f'"{p}"' for p in phrases[:max_phrases])
+    first_sentence = re.split(r"(?<=[.!?])\s", goal_text.strip(), maxsplit=1)[0]
+    return hypothesis_query(first_sentence, "")
 
 
 def report_lines(report_path) -> str:
@@ -850,10 +899,14 @@ def get_references_html(cycle_details: Dict, research_goal: Optional[ResearchGoa
             sections.append(f"<h3>🔎 Literature used in this cycle's reviews</h3>{cards}")
 
         if goal and goal.description and literature_enabled():
-            papers, errors = LiteratureSearch().search(goal.description)
+            query = goal_search_query(goal.description, cycle_details)
+            papers, errors = LiteratureSearch().search(query)
             if papers:
                 cards = "".join(paper_card(p, str(p.get("source"))) for p in papers)
-                sections.append(f"<h3>📚 Related papers for the research goal</h3>{cards}")
+                sections.append(
+                    f"<h3>📚 Related papers for the research goal</h3>"
+                    f"<p><em>Search: {html_lib.escape(query)}</em></p>{cards}"
+                )
             for error in errors:
                 sections.append(f'<p style="color: #c0392b;">{html_lib.escape(error)}</p>')
     except Exception as e:
@@ -862,6 +915,26 @@ def get_references_html(cycle_details: Dict, research_goal: Optional[ResearchGoa
 
     return "".join(sections) or "<p>No references for this cycle.</p>"
 
+
+# Typesets LaTeX in the results panel whenever Gradio replaces its content.
+KATEX_UI_HEAD = f"""
+<link rel="stylesheet" href="{KATEX_URL}/katex.min.css">
+<script defer src="{KATEX_URL}/katex.min.js"></script>
+<script defer src="{KATEX_URL}/contrib/auto-render.min.js"></script>
+<script>
+(() => {{
+  let pending = null;
+  const render = () => {{
+    pending = null;
+    const panel = document.getElementById("results-panel");
+    if (panel && window.renderMathInElement) window.renderMathInElement(panel, {KATEX_OPTIONS_JS});
+  }};
+  new MutationObserver(() => {{
+    if (!pending) pending = setTimeout(render, 150);
+  }}).observe(document.documentElement, {{ childList: true, subtree: true, characterData: true }});
+}})();
+</script>
+"""
 
 APP_CSS = """
 .gradio-container { max-width: 1200px !important; margin: 0 auto !important; }
@@ -1024,7 +1097,9 @@ def create_gradio_interface():
                 with gr.Row():
                     with gr.Column():
                         results_output = gr.HTML(
-                            label="Results", value="<p>Results will appear here after running cycles.</p>"
+                            label="Results",
+                            value="<p>Results will appear here after running cycles.</p>",
+                            elem_id="results-panel",
                         )
 
                 with gr.Row():
@@ -1158,4 +1233,5 @@ if __name__ == "__main__":
         allowed_paths=[str(reports_dir.resolve())],
         theme=app_theme(),
         css=APP_CSS,
+        head=KATEX_UI_HEAD,
     )

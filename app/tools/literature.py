@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -261,6 +262,8 @@ def search_pubmed(query: str, max_results: int = 3, timeout: float = 10) -> List
 
 
 _arxiv_tool = None
+# arXiv allows one request per 3 seconds; concurrent reviews must queue for the shared client.
+_arxiv_lock = threading.Lock()
 
 
 def _get_arxiv_tool():
@@ -302,7 +305,7 @@ def _arxiv_query(query: str, max_terms: int = _ARXIV_TERM_STEPS[0]) -> str:
     return " AND ".join(f"all:{w}" for w in _arxiv_terms(query)[:max_terms])
 
 
-def _quoted_phrases(query: str) -> List[str]:
+def quoted_phrases(query: str) -> List[str]:
     return [p.strip() for p in re.findall(r'"([^"]+)"', query or "") if p.strip()]
 
 
@@ -314,7 +317,7 @@ def _plain_query(query: str) -> str:
 def _arxiv_queries(query: str) -> List[str]:
     """Strict-to-loose arXiv queries. Quoted key phrases must each appear as a phrase; when
     nothing matches, the least important (last) phrases are dropped, keeping at least two."""
-    phrases = _quoted_phrases(query)
+    phrases = quoted_phrases(query)
     if phrases:
         queries = []
         for count in range(len(phrases), min(len(phrases), 2) - 1, -1):
@@ -331,12 +334,13 @@ def _arxiv_queries(query: str) -> List[str]:
 def search_arxiv(query: str, max_results: int = 3, timeout: float = 10) -> List[Dict]:
     import arxiv
 
-    tool = _get_arxiv_tool()
-    for arxiv_query in _arxiv_queries(query):
-        search = arxiv.Search(query=arxiv_query, max_results=max_results)
-        papers = [_from_arxiv_dict(tool._format_paper(result)) for result in tool.client.results(search)]
-        if papers:
-            return papers
+    with _arxiv_lock:
+        tool = _get_arxiv_tool()
+        for arxiv_query in _arxiv_queries(query):
+            search = arxiv.Search(query=arxiv_query, max_results=max_results)
+            papers = [_from_arxiv_dict(tool._format_paper(result)) for result in tool.client.results(search)]
+            if papers:
+                return papers
     return []
 
 
@@ -421,6 +425,15 @@ def hypothesis_query(title: str, text: str) -> str:
     return " ".join(words)[:200]
 
 
+def _wait_budget(source: str, timeout: float) -> float:
+    """How long to wait for one source. arXiv searches queue on one rate-limited client, so a
+    search may first wait for those of the other reviews running concurrently."""
+    budget = timeout + 5
+    if source == "arxiv":
+        budget *= max(1, int(config.get("llm_max_concurrency", 4) or 1))
+    return budget
+
+
 class LiteratureSearch:
     """Searches the configured sources in parallel; caches results per query."""
 
@@ -445,10 +458,11 @@ class LiteratureSearch:
         pool = ThreadPoolExecutor(max_workers=max(1, len(sources)))
         futures = {s: pool.submit(SOURCES[s], query, per_source, timeout) for s in sources}
         for source, future in futures.items():
+            wait = _wait_budget(source, timeout)
             try:
-                results.append(future.result(timeout=timeout + 5))
+                results.append(future.result(timeout=wait))
             except FutureTimeout:
-                errors.append(f"Literature search ({source}) failed: timed out after {timeout + 5:.0f}s")
+                errors.append(f"Literature search ({source}) failed: timed out after {wait:.0f}s")
             except Exception as e:  # noqa: BLE001 - any source failure must be reported, not raised
                 errors.append(_failure_message(source, e))
         pool.shutdown(wait=False, cancel_futures=True)

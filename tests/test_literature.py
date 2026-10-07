@@ -404,3 +404,10 @@ def test_run_cycle_resolves_user_references_once():
     assert resolver.call_count == 1
     assert details["user_references"][0]["label"] == "U1"
     assert goal.resolved_references[0]["kind"] == "note"
+
+
+def test_arxiv_wait_budget_covers_searches_queued_by_concurrent_reviews(monkeypatch):
+    monkeypatch.setitem(lit.config, "llm_max_concurrency", 4)
+
+    assert lit._wait_budget("openalex", 10) == 15
+    assert lit._wait_budget("arxiv", 10) == 60
