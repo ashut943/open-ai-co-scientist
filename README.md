@@ -100,7 +100,7 @@ The system uses a multi-agent approach:
 1. **Generation Agent:** Creates new research hypotheses.
 2. **Reflection Agent:** Reviews and assesses hypotheses for novelty and feasibility.
 3. **Ranking Agent:** LLM pairwise judging against the research goal, then Elo updates to rank hypotheses.
-4. **Evolution Agent:** Combines top hypotheses to create improved versions.
+4. **Evolution Agent:** LLM operators (refine / mutate / hybridize / simplify) create new child hypotheses linked by `parent_ids`.
 5. **Proximity Agent:** Analyzes similarity between hypotheses.
 6. **Meta-Review Agent:** Provides overall critique and suggests next steps.
 

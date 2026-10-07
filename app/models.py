@@ -28,6 +28,7 @@ class Hypothesis:
         self.references: List[str] = []
         self.is_active: bool = True
         self.parent_ids: List[str] = []  # Store IDs of parent hypotheses
+        self.evolution_operator: Optional[str] = None  # REFINE|MUTATE|HYBRIDIZE|SIMPLIFY
 
     def to_dict(self) -> dict:
         return {
@@ -40,7 +41,8 @@ class Hypothesis:
             "review_comments": self.review_comments,
             "references": self.references,
             "is_active": self.is_active,
-            "parent_ids": self.parent_ids,  # Include parent IDs
+            "parent_ids": self.parent_ids,
+            "evolution_operator": self.evolution_operator,
         }
 
 

@@ -364,19 +364,168 @@ def update_elo(winner: Hypothesis, loser: Hypothesis, k_factor: int):
     )
 
 
-# --- Evolution Helper (Moved from main.py) ---
+# --- Evolution Helpers ---
+
+EVOLUTION_OPERATORS = ("REFINE", "MUTATE", "HYBRIDIZE", "SIMPLIFY")
+
+_OPERATOR_INSTRUCTIONS = {
+    "REFINE": (
+        "Improve the parent hypothesis: fix weaknesses from reviews, strengthen "
+        "scientific soundness, clarity, testability/falsifiability, and safety. "
+        "Keep the core claim but produce a clearly improved child — do not only rephrase."
+    ),
+    "MUTATE": (
+        "Explore a different mechanism, assumption, or pathway while still addressing "
+        "the same research goal. Preserve useful insights from the parent but change "
+        "the underlying approach enough that this is a distinct alternative."
+    ),
+    "HYBRIDIZE": (
+        "Synthesize a new hypothesis that combines complementary strengths of the two "
+        "parents. Do not concatenate their text; produce a coherent hybrid mechanism "
+        "or proposal that is stronger than either alone."
+    ),
+    "SIMPLIFY": (
+        "Remove unnecessary assumptions, jargon, and side claims. Preserve the core "
+        "testable idea in a clearer, leaner form that is easier to falsify experimentally."
+    ),
+}
 
 
-def combine_hypotheses(hypoA: Hypothesis, hypoB: Hypothesis) -> Hypothesis:
-    """Combines two hypotheses into a new one."""
-    new_id = generate_unique_id("E")  # Use utility function
-    combined_title = f"Combined: {hypoA.title} & {hypoB.title}"
-    # Consider a more sophisticated combination prompt/logic if needed
-    combined_text = f"Combination of:\n1. {hypoA.text}\n2. {hypoB.text}"
-    logger.info("Combining hypotheses %s and %s into %s", hypoA.hypothesis_id, hypoB.hypothesis_id, new_id)
-    new_hypothesis = Hypothesis(new_id, combined_title, combined_text)
-    new_hypothesis.parent_ids = [hypoA.hypothesis_id, hypoB.hypothesis_id]
-    return new_hypothesis
+def _tournament_feedback_for(context: ContextMemory, hypothesis_ids: List[str]) -> str:
+    """Summarize recent tournament matches involving the given hypotheses."""
+    wanted = set(hypothesis_ids)
+    lines = []
+    for result in context.tournament_results[-20:]:
+        a = result.get("hypothesis_a") or result.get("winner")
+        b = result.get("hypothesis_b") or result.get("loser")
+        if a not in wanted and b not in wanted and result.get("winner") not in wanted:
+            continue
+        judgment = result.get("judgment") or {}
+        if result.get("tie"):
+            lines.append(
+                f"Tie between {result.get('hypothesis_a')} and {result.get('hypothesis_b')}: "
+                f"{judgment.get('reasoning', 'no reasoning')}"
+            )
+        else:
+            lines.append(
+                f"Winner {result.get('winner')} over {result.get('loser')}: {judgment.get('reasoning', 'no reasoning')}"
+            )
+    return "\n".join(lines) if lines else "No tournament feedback available yet."
+
+
+def _latest_meta_review_summary(context: ContextMemory) -> str:
+    if not context.meta_review_feedback:
+        return "No meta-review feedback from prior cycles yet."
+    latest = context.meta_review_feedback[-1]
+    critiques = latest.get("meta_review_critique") or []
+    next_steps = (latest.get("research_overview") or {}).get("suggested_next_steps") or []
+    parts = []
+    if critiques:
+        parts.append("Critiques: " + "; ".join(critiques))
+    if next_steps:
+        parts.append("Suggested next steps: " + "; ".join(next_steps))
+    return "\n".join(parts) if parts else "No meta-review feedback from prior cycles yet."
+
+
+def _format_parent_block(hypothesis: Hypothesis) -> str:
+    return (
+        f"ID: {hypothesis.hypothesis_id}\n"
+        f"Title: {hypothesis.title}\n"
+        f"Text: {hypothesis.text}\n"
+        f"Prior reviews:\n{_format_hypothesis_reviews(hypothesis)}"
+    )
+
+
+def call_llm_for_evolution(
+    research_goal: ResearchGoal,
+    operator: str,
+    parents: List[Hypothesis],
+    context: ContextMemory,
+    temperature: float | None = None,
+) -> Dict:
+    """Ask the LLM to produce a child hypothesis for the given evolution operator."""
+    if operator not in _OPERATOR_INSTRUCTIONS:
+        raise ValueError(f"Unknown evolution operator: {operator}")
+    if not parents:
+        raise ValueError("Evolution requires at least one parent hypothesis")
+    if operator == "HYBRIDIZE" and len(parents) < 2:
+        raise ValueError("HYBRIDIZE requires two parent hypotheses")
+
+    parent_ids = [p.hypothesis_id for p in parents]
+    parent_blocks = "\n\n".join(
+        f"Parent {chr(ord('A') + i)}:\n{_format_parent_block(p)}" for i, p in enumerate(parents)
+    )
+    evo_temp = temperature if temperature is not None else research_goal.generation_temperature
+
+    prompt = (
+        f"You are evolving scientific hypotheses for a research program.\n\n"
+        f"Research goal:\n{research_goal.description}\n\n"
+        f"Constraints: {research_goal.constraints}\n\n"
+        f"Evolution operator: {operator}\n"
+        f"{_OPERATOR_INSTRUCTIONS[operator]}\n\n"
+        f"{parent_blocks}\n\n"
+        f"Tournament feedback involving parent(s):\n"
+        f"{_tournament_feedback_for(context, parent_ids)}\n\n"
+        f"Meta-review feedback (from prior cycles if any):\n"
+        f"{_latest_meta_review_summary(context)}\n\n"
+        f"Return ONLY a JSON object with keys:\n"
+        f'  "title": short title for the NEW child hypothesis,\n'
+        f'  "text": full statement of the NEW child hypothesis,\n'
+        f'  "reasoning": brief note of what changed and why.\n'
+        f"Do not modify the parents in place; invent a distinct child.\n"
+    )
+
+    response = call_llm(prompt, temperature=evo_temp, model=research_goal.llm_model)
+    logger.info("Evolution (%s) LLM response for parents %s: %s", operator, parent_ids, response)
+
+    if response.startswith("Error:") or response.startswith("Authentication with"):
+        logger.error("Evolution LLM call failed (%s): %s", operator, response)
+        return {"title": "Error", "text": response, "reasoning": ""}
+
+    try:
+        parsed = json.loads(_strip_json_fences(response))
+        title = parsed.get("title")
+        text = parsed.get("text")
+        if not isinstance(title, str) or not title.strip() or not isinstance(text, str) or not text.strip():
+            raise ValueError("Evolution response missing non-empty title/text")
+        reasoning = parsed.get("reasoning", "")
+        if not isinstance(reasoning, str):
+            reasoning = str(reasoning)
+        return {"title": title.strip(), "text": text.strip(), "reasoning": reasoning.strip()}
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
+        logger.warning("Could not parse evolution response: %s", response, exc_info=True)
+        return {"title": "Error", "text": f"Could not parse LLM response: {e}", "reasoning": ""}
+
+
+def evolve_hypothesis(
+    operator: str,
+    parents: List[Hypothesis],
+    research_goal: ResearchGoal,
+    context: ContextMemory,
+) -> Hypothesis | None:
+    """Create a new child hypothesis via an evolution operator. Never mutates parents."""
+    idea = call_llm_for_evolution(research_goal, operator, parents, context)
+    if idea["title"] == "Error":
+        logger.error("Skipping %s evolution: %s", operator, idea["text"])
+        return None
+
+    new_id = generate_unique_id("E")
+    while new_id in context.hypotheses:
+        new_id = generate_unique_id("E")
+
+    child = Hypothesis(new_id, idea["title"], idea["text"])
+    child.parent_ids = [p.hypothesis_id for p in parents]
+    child.evolution_operator = operator
+    if idea["reasoning"]:
+        child.review_comments.append(f"[{operator}] {idea['reasoning']}")
+    logger.info(
+        "Evolved %s -> %s via %s (parents=%s)",
+        [p.hypothesis_id for p in parents],
+        child.hypothesis_id,
+        operator,
+        child.parent_ids,
+    )
+    return child
 
 
 ###############################################################################
@@ -520,29 +669,42 @@ class RankingAgent:
 
 class EvolutionAgent:
     def evolve_hypotheses(self, context: ContextMemory, research_goal: ResearchGoal) -> List[Hypothesis]:
-        """Evolves hypotheses by combining top candidates, using research_goal settings."""
-        # Use top_k from research_goal
+        """Evolve top hypotheses into new children via LLM operators.
+
+        Operators (each creates a distinct child; parents are never mutated):
+          REFINE / MUTATE / SIMPLIFY on the top-ranked hypothesis
+          HYBRIDIZE on the top two when available
+
+        Uses research goal, reflection reviews, tournament feedback, and any
+        prior-cycle meta-review stored on the context.
+        """
         top_k = research_goal.top_k_hypotheses
         active = context.get_active_hypotheses()
-        if len(active) < 2:
-            logger.info("Not enough active hypotheses to perform evolution.")
+        if not active:
+            logger.info("No active hypotheses to evolve.")
             return []
 
-        sorted_by_elo = sorted(active, key=lambda h: h.elo_score, reverse=True)
-        top_candidates = sorted_by_elo[:top_k]
+        top_candidates = sorted(active, key=lambda h: h.elo_score, reverse=True)[: max(1, top_k)]
+        primary = top_candidates[0]
+        new_hypotheses: List[Hypothesis] = []
 
-        new_hypotheses = []
-        # Combine the top two for now, could be extended
+        for operator in ("REFINE", "MUTATE", "SIMPLIFY"):
+            child = evolve_hypothesis(operator, [primary], research_goal, context)
+            if child is not None:
+                new_hypotheses.append(child)
+
         if len(top_candidates) >= 2:
-            # Optional: Add check to prevent combining very similar hypotheses
-            # sim = similarity_score(top_candidates[0].text, top_candidates[1].text)
-            # if sim < 0.8: # Example threshold
-            new_h = combine_hypotheses(top_candidates[0], top_candidates[1])
-            logger.info("Evolved hypothesis created: %s from parents %s", new_h.hypothesis_id, new_h.parent_ids)
-            new_hypotheses.append(new_h)
-            # else:
-            #     logger.info("Skipping evolution: Top 2 hypotheses are too similar (score: %.2f)", sim)
+            hybrid = evolve_hypothesis("HYBRIDIZE", [top_candidates[0], top_candidates[1]], research_goal, context)
+            if hybrid is not None:
+                new_hypotheses.append(hybrid)
+        else:
+            logger.info("Skipping HYBRIDIZE: need at least two active hypotheses.")
 
+        logger.info(
+            "Evolution produced %d child hypotheses from top candidates %s",
+            len(new_hypotheses),
+            [h.hypothesis_id for h in top_candidates],
+        )
         return new_hypotheses
 
 

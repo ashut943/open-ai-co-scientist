@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Evolution no longer string-concatenates top hypotheses. The Evolution agent
+  creates **new child** hypotheses (via `parent_ids`, never in-place mutation)
+  using LLM operators: REFINE, MUTATE, SIMPLIFY on the top-ranked idea, and
+  HYBRIDIZE on the top two when available. Prompts include the research goal,
+  reflection reviews, tournament feedback, and prior-cycle meta-review.
 - Default LLM provider is now OpenAI-compatible / Parley (`llm_provider:
   openai`, `openai_base_url: https://parley.api.mit.edu/v1`). OpenRouter
   remains available via `LLM_PROVIDER=openrouter`. Offline tests target the
