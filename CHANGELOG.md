@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Tournaments no longer judge every pair: each hypothesis plays about
+  `tournament_matches_per_hypothesis` (default 3) LLM-judged matches, so judge
+  calls grow linearly instead of as n*(n-1)/2 (set 0 for a full round-robin).
+  Hypotheses that already have a successful reflection review are not
+  re-reviewed in later cycles.
 - Meta-review is now an LLM analysis (recurring strengths/weaknesses,
   unexplored mechanisms, shared assumptions, contradictions, promising pairs,
   research gaps, recommended evolution strategy) and runs **before** evolution

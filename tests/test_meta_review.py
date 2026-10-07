@@ -180,3 +180,35 @@ def test_run_cycle_orders_meta_review_before_evolution():
     assert "evolution_prompt" in step_order
     assert step_order.index("meta_prompt") < step_order.index("evolution_prompt")
     assert details["meta_review"]["recurring_strengths"]
+
+
+def test_run_cycle_skips_reflection_for_already_reviewed_hypotheses():
+    goal = ResearchGoal(description="Goal", num_hypotheses=1)
+    context = ContextMemory()
+    context.add_hypothesis(_hypo("G0", "Old", "previously reviewed idea"))
+    reviewed_texts: list[str] = []
+
+    def fake_llm(prompt, temperature=0.7, model=None):
+        if "Score the hypothesis" in prompt:
+            reviewed_texts.append(prompt)
+            return json.dumps({"review_scores": {"novelty": 4}, "comment": "ok", "references": []})
+        if "tournament judge" in prompt.lower():
+            return json.dumps({"winner": "A", "confidence": 0.7, "reasoning": "A", "criterion_scores": {}})
+        if "Evolution operator:" in prompt:
+            return json.dumps({"title": "Evo", "text": "evolved body", "reasoning": "r"})
+        if "conducting a meta-review" in prompt:
+            return _meta_payload()
+        return json.dumps([{"title": "New", "text": "fresh idea"}])
+
+    with (
+        patch("app.agents.call_llm", side_effect=fake_llm),
+        patch(
+            "app.agents.ProximityAgent.build_proximity_graph",
+            return_value={"adjacency_graph": {}, "nodes": [], "edges": []},
+        ),
+    ):
+        SupervisorAgent().run_cycle(goal, context)
+
+    assert reviewed_texts
+    assert not any("previously reviewed idea" in p for p in reviewed_texts)
+    assert any("fresh idea" in p for p in reviewed_texts)

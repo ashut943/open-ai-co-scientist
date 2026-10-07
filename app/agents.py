@@ -4,6 +4,7 @@ import random
 from typing import Dict, List, Tuple
 
 # Import necessary components from other modules
+from .config import config
 from .models import REVIEW_SCORE_KEYS, ContextMemory, Hypothesis, ResearchGoal
 from .utils import (
     call_llm,
@@ -758,6 +759,41 @@ class ReflectionAgent:
             )
 
 
+def _has_review(h: Hypothesis) -> bool:
+    return any((score or 0) > 0 for score in (h.review_scores or {}).values())
+
+
+def _select_tournament_pairs(
+    hypotheses: List[Hypothesis], matches_per_hypothesis: int | None
+) -> List[Tuple[Hypothesis, Hypothesis]]:
+    """Pick pairs so each hypothesis plays about `matches_per_hypothesis` matches.
+
+    Each pair is one LLM judge call, so a full round-robin (n*(n-1)/2) is only
+    used when the cap is unset/non-positive or already covers every pair.
+    """
+    all_pairs = [(hypotheses[i], hypotheses[j]) for i in range(len(hypotheses)) for j in range(i + 1, len(hypotheses))]
+    if not matches_per_hypothesis or matches_per_hypothesis <= 0 or matches_per_hypothesis >= len(hypotheses) - 1:
+        return all_pairs
+
+    random.shuffle(all_pairs)
+    counts = {h.hypothesis_id: 0 for h in hypotheses}
+    selected: List[Tuple[Hypothesis, Hypothesis]] = []
+    remaining: List[Tuple[Hypothesis, Hypothesis]] = []
+    for hA, hB in all_pairs:
+        if counts[hA.hypothesis_id] < matches_per_hypothesis and counts[hB.hypothesis_id] < matches_per_hypothesis:
+            selected.append((hA, hB))
+            counts[hA.hypothesis_id] += 1
+            counts[hB.hypothesis_id] += 1
+        else:
+            remaining.append((hA, hB))
+    for hA, hB in remaining:
+        if counts[hA.hypothesis_id] < matches_per_hypothesis or counts[hB.hypothesis_id] < matches_per_hypothesis:
+            selected.append((hA, hB))
+            counts[hA.hypothesis_id] += 1
+            counts[hB.hypothesis_id] += 1
+    return selected
+
+
 class RankingAgent:
     def run_tournament(self, hypotheses: List[Hypothesis], context: ContextMemory, research_goal: ResearchGoal) -> None:
         """Runs a pairwise tournament to rank hypotheses, using research_goal settings."""
@@ -775,11 +811,7 @@ class RankingAgent:
 
         random.shuffle(active_hypotheses)  # Shuffle only active ones
 
-        # Simple round-robin: each active hypothesis debates every other active one once
-        pairs = []
-        for i in range(len(active_hypotheses)):
-            for j in range(i + 1, len(active_hypotheses)):
-                pairs.append((active_hypotheses[i], active_hypotheses[j]))
+        pairs = _select_tournament_pairs(active_hypotheses, config.get("tournament_matches_per_hypothesis", 3))
 
         logger.info(f"Running tournament with {len(pairs)} pairs.")
         for hA, hB in pairs:
@@ -1210,9 +1242,10 @@ class SupervisorAgent:
 
         active_hypos = context.get_active_hypotheses()
 
-        # 2. Reflection
+        # 2. Reflection (hypotheses with a successful prior review keep it)
         logger.info("Step 2: Reflection")
-        self.reflection_agent.review_hypotheses(active_hypos, context, research_goal)
+        unreviewed = [h for h in active_hypos if not _has_review(h)]
+        self.reflection_agent.review_hypotheses(unreviewed, context, research_goal)
         cycle_details["steps"]["reflection"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
 
         # 3. Ranking (Tournament 1)

@@ -14,7 +14,7 @@ In this repo, a **cycle** is one click of **Run Cycle** in the Gradio UI: one fu
 
 ![One Open AI Co-Scientist cycle schematic](parley-cycle-schematic.png)
 
-With default `num_hypotheses: 4`, a cycle is roughly **1 generation + N reflections + 1 meta-review + up to 4 evolution LLM calls + reflections on evolved children + pairwise tournament judgments**. Proximity remains mostly local.  
+With default `num_hypotheses: 4`, a cycle is roughly **1 generation + reflections on new (not yet reviewed) hypotheses + 1 meta-review + up to 4 evolution LLM calls + reflections on evolved children + two tournaments**. Each tournament makes about `n × tournament_matches_per_hypothesis / 2` judge calls for `n` active hypotheses (default 3 matches each), up to `n × 3`. In cycle 1 with 4 generated and 4 evolved hypotheses, that is about 30–35 LLM calls in total. Proximity remains mostly local.  
 “Cycles on $30” in the cost table = how many of these Run Cycle passes fit under the token-budget assumption below.
 
 ## Cost vs science scatter (co-scientist use case)

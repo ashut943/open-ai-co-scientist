@@ -29,6 +29,10 @@ llm_request_timeout_seconds: 30
 # Elo K-factor
 elo_k_factor: 32
 
+# Tournament matches per hypothesis (each match is one LLM judge call).
+# 0 runs a full round-robin, which grows as n*(n-1)/2.
+tournament_matches_per_hypothesis: 3
+
 # Top K hypotheses for evolution
 top_k_hypotheses: 2
 

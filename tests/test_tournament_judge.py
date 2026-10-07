@@ -6,6 +6,7 @@ from unittest.mock import patch
 from app.agents import (
     RankingAgent,
     _score_based_winner,
+    _select_tournament_pairs,
     judge_pair,
     run_pairwise_debate,
     update_elo,
@@ -208,3 +209,25 @@ def test_tournament_tie_does_not_update_elo():
     assert b.elo_score == 1100.0
     assert context.tournament_results[0]["tie"] is True
     assert context.tournament_results[0]["winner"] is None
+
+
+def test_select_tournament_pairs_caps_matches_per_hypothesis():
+    hypos = [_hypo(f"G{i}", f"T{i}", f"text {i}") for i in range(16)]
+
+    pairs = _select_tournament_pairs(hypos, 3)
+
+    assert len(pairs) < 16 * 15 // 2
+    assert len({frozenset((a.hypothesis_id, b.hypothesis_id)) for a, b in pairs}) == len(pairs)
+    counts = {h.hypothesis_id: 0 for h in hypos}
+    for a, b in pairs:
+        counts[a.hypothesis_id] += 1
+        counts[b.hypothesis_id] += 1
+    assert all(c >= 3 for c in counts.values())
+    assert len(pairs) <= 16 * 3
+
+
+def test_select_tournament_pairs_full_round_robin_when_uncapped_or_small():
+    hypos = [_hypo(f"G{i}", f"T{i}", f"text {i}") for i in range(4)]
+
+    assert len(_select_tournament_pairs(hypos, 0)) == 6
+    assert len(_select_tournament_pairs(hypos, 3)) == 6
