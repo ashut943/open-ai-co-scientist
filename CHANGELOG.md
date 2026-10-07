@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Meta-review is now an LLM analysis (recurring strengths/weaknesses,
+  unexplored mechanisms, shared assumptions, contradictions, promising pairs,
+  research gaps, recommended evolution strategy) and runs **before** evolution
+  so its strategy controls which operators/parents are used. Cycle order is
+  Generation → Reflection → Tournament → Meta-review → Evolution → Reflection →
+  Tournament → Proximity.
 - Reflection now returns a peer-review schema with 1-5 scores (soundness,
   novelty, relevance, feasibility, testability, clarity, impact) plus
   strengths/weaknesses, critical assumptions, falsification conditions,

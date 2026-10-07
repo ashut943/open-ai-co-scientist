@@ -530,18 +530,42 @@ def _tournament_feedback_for(context: ContextMemory, hypothesis_ids: List[str]) 
     return "\n".join(lines) if lines else "No tournament feedback available yet."
 
 
+META_REVIEW_LIST_KEYS = (
+    "recurring_strengths",
+    "recurring_weaknesses",
+    "unexplored_mechanisms",
+    "shared_assumptions",
+    "contradictions",
+    "promising_hypothesis_pairs",
+    "research_gaps",
+    "recommended_evolution_strategy",
+)
+
+
+def _empty_meta_review() -> Dict:
+    return {key: [] for key in META_REVIEW_LIST_KEYS}
+
+
 def _latest_meta_review_summary(context: ContextMemory) -> str:
     if not context.meta_review_feedback:
-        return "No meta-review feedback from prior cycles yet."
+        return "No meta-review feedback available yet."
     latest = context.meta_review_feedback[-1]
-    critiques = latest.get("meta_review_critique") or []
-    next_steps = (latest.get("research_overview") or {}).get("suggested_next_steps") or []
     parts = []
+    for key in META_REVIEW_LIST_KEYS:
+        values = latest.get(key) or []
+        if not values:
+            continue
+        rendered = []
+        for item in values:
+            if isinstance(item, dict):
+                rendered.append(json.dumps(item, sort_keys=True))
+            else:
+                rendered.append(str(item))
+        parts.append(f"{key}: " + "; ".join(rendered))
+    critiques = latest.get("meta_review_critique") or []
     if critiques:
-        parts.append("Critiques: " + "; ".join(critiques))
-    if next_steps:
-        parts.append("Suggested next steps: " + "; ".join(next_steps))
-    return "\n".join(parts) if parts else "No meta-review feedback from prior cycles yet."
+        parts.append("Critiques: " + "; ".join(str(c) for c in critiques))
+    return "\n".join(parts) if parts else "No meta-review feedback available yet."
 
 
 def _format_parent_block(hypothesis: Hypothesis) -> str:
@@ -583,7 +607,7 @@ def call_llm_for_evolution(
         f"{parent_blocks}\n\n"
         f"Tournament feedback involving parent(s):\n"
         f"{_tournament_feedback_for(context, parent_ids)}\n\n"
-        f"Meta-review feedback (from prior cycles if any):\n"
+        f"Latest meta-review guidance (should steer this evolution):\n"
         f"{_latest_meta_review_summary(context)}\n\n"
         f"Return ONLY a JSON object with keys:\n"
         f'  "title": short title for the NEW child hypothesis,\n'
@@ -790,16 +814,114 @@ class RankingAgent:
             context.tournament_results.append(result_record)
 
 
+def _parse_operator_name(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    token = value.strip().upper()
+    for operator in EVOLUTION_OPERATORS:
+        if token == operator or token.startswith(operator + " ") or f" {operator} " in f" {token} ":
+            return operator
+    return None
+
+
+def _parent_ids_from_strategy_item(item) -> List[str]:
+    if isinstance(item, dict):
+        raw = item.get("parent_ids") or item.get("parents") or item.get("ids") or []
+        if isinstance(raw, str):
+            return [raw]
+        if isinstance(raw, list):
+            return [str(x) for x in raw if x]
+    return []
+
+
+def _pair_ids(item) -> List[str]:
+    if isinstance(item, (list, tuple)) and len(item) >= 2:
+        return [str(item[0]), str(item[1])]
+    if isinstance(item, dict):
+        ids = item.get("ids") or item.get("parent_ids") or item.get("pair") or []
+        if isinstance(ids, list) and len(ids) >= 2:
+            return [str(ids[0]), str(ids[1])]
+        a, b = item.get("a") or item.get("hypothesis_a"), item.get("b") or item.get("hypothesis_b")
+        if a and b:
+            return [str(a), str(b)]
+    if isinstance(item, str) and ("+" in item or " and " in item.lower()):
+        parts = [p.strip() for p in item.replace("+", " and ").split(" and ") if p.strip()]
+        if len(parts) >= 2:
+            return parts[:2]
+    return []
+
+
+def _plan_evolutions_from_meta(
+    meta: Dict,
+    top_candidates: List[Hypothesis],
+    context: ContextMemory,
+    max_ops: int = 4,
+) -> List[Tuple[str, List[Hypothesis]]]:
+    """Turn meta-review strategy/pairs into concrete (operator, parents) plans."""
+    by_id = {h.hypothesis_id: h for h in context.get_active_hypotheses()}
+    planned: List[Tuple[str, List[Hypothesis]]] = []
+    seen: set[tuple] = set()
+
+    def add(operator: str, parents: List[Hypothesis]) -> None:
+        if len(planned) >= max_ops or not parents:
+            return
+        if operator == "HYBRIDIZE" and len(parents) < 2:
+            return
+        if operator != "HYBRIDIZE":
+            parents = parents[:1]
+        key = (operator, tuple(p.hypothesis_id for p in parents))
+        if key in seen:
+            return
+        seen.add(key)
+        planned.append((operator, parents))
+
+    for item in meta.get("recommended_evolution_strategy") or []:
+        if isinstance(item, dict):
+            operator = _parse_operator_name(item.get("operator") or item.get("strategy") or "")
+            parent_ids = _parent_ids_from_strategy_item(item)
+        else:
+            operator = _parse_operator_name(str(item))
+            parent_ids = []
+        if not operator:
+            continue
+        parents = [by_id[pid] for pid in parent_ids if pid in by_id]
+        if not parents and top_candidates:
+            if operator == "HYBRIDIZE" and len(top_candidates) >= 2:
+                parents = top_candidates[:2]
+            else:
+                parents = [top_candidates[0]]
+        add(operator, parents)
+
+    for item in meta.get("promising_hypothesis_pairs") or []:
+        ids = _pair_ids(item)
+        parents = [by_id[pid] for pid in ids if pid in by_id]
+        if len(parents) >= 2:
+            add("HYBRIDIZE", parents[:2])
+
+    return planned
+
+
+def _default_evolution_plan(top_candidates: List[Hypothesis]) -> List[Tuple[str, List[Hypothesis]]]:
+    if not top_candidates:
+        return []
+    primary = top_candidates[0]
+    plan: List[Tuple[str, List[Hypothesis]]] = [
+        ("REFINE", [primary]),
+        ("MUTATE", [primary]),
+        ("SIMPLIFY", [primary]),
+    ]
+    if len(top_candidates) >= 2:
+        plan.append(("HYBRIDIZE", [top_candidates[0], top_candidates[1]]))
+    return plan
+
+
 class EvolutionAgent:
     def evolve_hypotheses(self, context: ContextMemory, research_goal: ResearchGoal) -> List[Hypothesis]:
-        """Evolve top hypotheses into new children via LLM operators.
+        """Evolve hypotheses into new children via LLM operators.
 
-        Operators (each creates a distinct child; parents are never mutated):
-          REFINE / MUTATE / SIMPLIFY on the top-ranked hypothesis
-          HYBRIDIZE on the top two when available
-
-        Uses research goal, reflection reviews, tournament feedback, and any
-        prior-cycle meta-review stored on the context.
+        Prefers the latest meta-review's recommended_evolution_strategy and
+        promising_hypothesis_pairs; falls back to REFINE/MUTATE/SIMPLIFY on the
+        top-ranked hypothesis and HYBRIDIZE on the top two. Parents are never mutated.
         """
         top_k = research_goal.top_k_hypotheses
         active = context.get_active_hypotheses()
@@ -808,23 +930,25 @@ class EvolutionAgent:
             return []
 
         top_candidates = sorted(active, key=lambda h: h.elo_score, reverse=True)[: max(1, top_k)]
-        primary = top_candidates[0]
-        new_hypotheses: List[Hypothesis] = []
+        meta = context.meta_review_feedback[-1] if context.meta_review_feedback else {}
+        planned = _plan_evolutions_from_meta(meta, top_candidates, context)
+        if not planned:
+            planned = _default_evolution_plan(top_candidates)
+            logger.info("No usable meta-review evolution plan; using defaults.")
+        else:
+            logger.info(
+                "Using meta-review-guided evolution plan: %s",
+                [(op, [p.hypothesis_id for p in parents]) for op, parents in planned],
+            )
 
-        for operator in ("REFINE", "MUTATE", "SIMPLIFY"):
-            child = evolve_hypothesis(operator, [primary], research_goal, context)
+        new_hypotheses: List[Hypothesis] = []
+        for operator, parents in planned:
+            child = evolve_hypothesis(operator, parents, research_goal, context)
             if child is not None:
                 new_hypotheses.append(child)
 
-        if len(top_candidates) >= 2:
-            hybrid = evolve_hypothesis("HYBRIDIZE", [top_candidates[0], top_candidates[1]], research_goal, context)
-            if hybrid is not None:
-                new_hypotheses.append(hybrid)
-        else:
-            logger.info("Skipping HYBRIDIZE: need at least two active hypotheses.")
-
         logger.info(
-            "Evolution produced %d child hypotheses from top candidates %s",
+            "Evolution produced %d child hypotheses from plan on top candidates %s",
             len(new_hypotheses),
             [h.hypothesis_id for h in top_candidates],
         )
@@ -860,49 +984,195 @@ class ProximityAgent:
         return {"adjacency_graph": adjacency, "nodes": visjs_data["nodes"], "edges": visjs_data["edges"]}
 
 
+def _hypothesis_meta_snapshot(hypothesis: Hypothesis) -> str:
+    scores = ""
+    if hypothesis.review_scores:
+        scores = ", ".join(f"{k}={v}" for k, v in hypothesis.review_scores.items() if v)
+    return (
+        f"- {hypothesis.hypothesis_id} | Elo={hypothesis.elo_score:.1f} | "
+        f"Novelty={hypothesis.novelty_review} | Feasibility={hypothesis.feasibility_review}\n"
+        f"  Title: {hypothesis.title}\n"
+        f"  Text: {hypothesis.text}\n"
+        f"  Scores: {scores or 'n/a'}\n"
+        f"  Weaknesses: {'; '.join(hypothesis.review_weaknesses) or 'n/a'}\n"
+        f"  Critical assumptions: {'; '.join(hypothesis.critical_assumptions) or 'n/a'}\n"
+        f"  Falsification: {'; '.join(hypothesis.falsification_conditions) or 'n/a'}"
+    )
+
+
+def _rule_based_meta_review(active_hypotheses: List[Hypothesis]) -> Dict:
+    """Offline/fallback meta-review when the LLM call fails."""
+    meta = _empty_meta_review()
+    for h in active_hypotheses:
+        if h.review_strengths:
+            meta["recurring_strengths"].extend(h.review_strengths[:2])
+        if h.review_weaknesses:
+            meta["recurring_weaknesses"].extend(h.review_weaknesses[:2])
+        if h.critical_assumptions:
+            meta["shared_assumptions"].extend(h.critical_assumptions[:2])
+        if h.novelty_review == "LOW" or (h.review_scores.get("novelty") or 0) <= 2:
+            meta["recurring_weaknesses"].append(f"{h.hypothesis_id}: low novelty")
+        if h.feasibility_review == "LOW" or (h.review_scores.get("feasibility") or 0) <= 2:
+            meta["recurring_weaknesses"].append(f"{h.hypothesis_id}: low feasibility")
+    ranked = sorted(active_hypotheses, key=lambda h: h.elo_score, reverse=True)
+    if ranked:
+        meta["recommended_evolution_strategy"] = [
+            {"operator": "REFINE", "parent_ids": [ranked[0].hypothesis_id]},
+            {"operator": "MUTATE", "parent_ids": [ranked[0].hypothesis_id]},
+            {"operator": "SIMPLIFY", "parent_ids": [ranked[0].hypothesis_id]},
+        ]
+        if len(ranked) >= 2:
+            pair = [ranked[0].hypothesis_id, ranked[1].hypothesis_id]
+            meta["promising_hypothesis_pairs"].append({"ids": pair, "reason": "Top Elo pair"})
+            meta["recommended_evolution_strategy"].append({"operator": "HYBRIDIZE", "parent_ids": pair})
+    return meta
+
+
+def call_llm_for_meta_review(
+    research_goal: ResearchGoal,
+    context: ContextMemory,
+    adjacency: Dict | None = None,
+) -> Dict:
+    """LLM meta-review over current hypotheses, reviews, and tournament outcomes."""
+    active = context.get_active_hypotheses()
+    if not active:
+        return _empty_meta_review()
+
+    hypo_block = "\n".join(_hypothesis_meta_snapshot(h) for h in active)
+    tournament_lines = []
+    for result in context.tournament_results[-30:]:
+        judgment = result.get("judgment") or {}
+        if result.get("tie"):
+            tournament_lines.append(
+                f"Tie {result.get('hypothesis_a')} vs {result.get('hypothesis_b')}: {judgment.get('reasoning', '')}"
+            )
+        else:
+            tournament_lines.append(
+                f"{result.get('winner')} beat {result.get('loser')}: {judgment.get('reasoning', '')}"
+            )
+    tournament_block = "\n".join(tournament_lines) if tournament_lines else "No tournament results yet."
+    adjacency_note = "Not available."
+    if adjacency:
+        adjacency_note = f"{len(adjacency)} nodes in proximity graph (similarity links among active hypotheses)."
+
+    prompt = (
+        f"You are conducting a meta-review of a scientific hypothesis tournament.\n\n"
+        f"Research goal:\n{research_goal.description}\n\n"
+        f"Constraints: {research_goal.constraints}\n\n"
+        f"Current hypotheses and reflection reviews:\n{hypo_block}\n\n"
+        f"Recent tournament outcomes:\n{tournament_block}\n\n"
+        f"Proximity/similarity context: {adjacency_note}\n\n"
+        f"Analyze recurring themes across reviews and matches. Identify strengths, "
+        f"weaknesses, unexplored mechanisms, shared assumptions, contradictions, "
+        f"promising pairs to hybridize, research gaps, and a concrete evolution strategy.\n\n"
+        f"Return ONLY a JSON object with these keys (all lists):\n"
+        f'  "recurring_strengths": strings,\n'
+        f'  "recurring_weaknesses": strings,\n'
+        f'  "unexplored_mechanisms": strings,\n'
+        f'  "shared_assumptions": strings,\n'
+        f'  "contradictions": strings,\n'
+        f'  "promising_hypothesis_pairs": objects like '
+        f'{{"ids": ["H1", "H2"], "reason": "..."}},\n'
+        f'  "research_gaps": strings,\n'
+        f'  "recommended_evolution_strategy": objects like '
+        f'{{"operator": "REFINE"|"MUTATE"|"HYBRIDIZE"|"SIMPLIFY", '
+        f'"parent_ids": ["H1"], "rationale": "..."}}.\n'
+        f"Use real hypothesis IDs from the list above. Prefer at most 4 evolution actions.\n"
+    )
+
+    response = call_llm(
+        prompt,
+        temperature=research_goal.reflection_temperature,
+        model=research_goal.llm_model,
+    )
+    logger.info("Meta-review LLM response: %s", response)
+
+    if response.startswith("Error:") or response.startswith("Authentication with"):
+        logger.error("Meta-review LLM call failed: %s", response)
+        return _rule_based_meta_review(active)
+
+    try:
+        parsed = json.loads(_strip_json_fences(response))
+        if not isinstance(parsed, dict):
+            raise ValueError("Meta-review response is not a JSON object")
+        meta = _empty_meta_review()
+        for key in META_REVIEW_LIST_KEYS:
+            value = parsed.get(key, [])
+            if value is None:
+                value = []
+            if not isinstance(value, list):
+                value = [value]
+            meta[key] = value
+        return meta
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
+        logger.warning("Could not parse meta-review response: %s", response, exc_info=True)
+        fallback = _rule_based_meta_review(active)
+        fallback["recurring_weaknesses"].append(f"Meta-review parse fallback: {e}")
+        return fallback
+
+
 class MetaReviewAgent:
-    def summarize_and_feedback(self, context: ContextMemory, adjacency: Dict) -> Dict:
-        """Summarizes research state and provides feedback."""
+    def summarize_and_feedback(
+        self,
+        context: ContextMemory,
+        adjacency: Dict | None = None,
+        research_goal: ResearchGoal | None = None,
+    ) -> Dict:
+        """LLM meta-review that steers the next evolution step.
+
+        Returns both the rich analysis fields and legacy UI keys
+        (`meta_review_critique`, `research_overview`).
+        """
         active_hypotheses = context.get_active_hypotheses()
         if not active_hypotheses:
-            return {
+            overview = {
+                **_empty_meta_review(),
                 "meta_review_critique": ["No active hypotheses."],
                 "research_overview": {"top_ranked_hypotheses": [], "suggested_next_steps": []},
             }
+            context.meta_review_feedback.append(overview)
+            return overview
 
-        comment_summary = set()
-        for h in active_hypotheses:
-            if h.novelty_review == "LOW" or (h.review_scores.get("novelty") or 0) <= 2:
-                comment_summary.add("Some ideas lack novelty.")
-            if h.feasibility_review == "LOW" or (h.review_scores.get("feasibility") or 0) <= 2:
-                comment_summary.add("Some ideas may have low feasibility.")
-            if (h.review_scores.get("testability") or 0) <= 2:
-                comment_summary.add("Some ideas are weakly testable or hard to falsify.")
-            if h.safety_ethical_concerns:
-                comment_summary.add("Safety or ethical concerns were raised for one or more hypotheses.")
-            if h.critical_assumptions:
-                comment_summary.add("Critical assumptions should be examined before investing further.")
+        if research_goal is None:
+            # Tests/callers may omit the goal; synthesize a minimal placeholder.
+            research_goal = ResearchGoal(description="(unspecified research goal)")
 
+        meta = call_llm_for_meta_review(research_goal, context, adjacency=adjacency)
         best_hypotheses = sorted(active_hypotheses, key=lambda h: h.elo_score, reverse=True)[:3]
-        logger.info("Top hypotheses for meta-review: %s", [h.hypothesis_id for h in best_hypotheses])
 
-        next_steps = [
-            "Refine top hypotheses using recommended improvements and weaknesses from reflection.",
-            "Probe critical assumptions and design tests aimed at falsification conditions.",
-            "Consider exploring areas with fewer, less connected hypotheses (if any).",
-            "Seek external expert feedback on top candidates.",
-        ]
-        if not comment_summary:
-            comment_summary.add("Overall hypothesis quality seems reasonable based on automated review.")
+        critique: List[str] = []
+        for key in ("recurring_weaknesses", "contradictions", "research_gaps", "shared_assumptions"):
+            for item in meta.get(key) or []:
+                critique.append(f"{key}: {item if not isinstance(item, dict) else json.dumps(item)}")
+        if not critique:
+            critique.append("No major recurring issues identified by meta-review.")
+
+        next_steps: List[str] = []
+        for item in meta.get("recommended_evolution_strategy") or []:
+            if isinstance(item, dict):
+                op = item.get("operator", "EVOLVE")
+                parents = item.get("parent_ids") or item.get("ids") or []
+                rationale = item.get("rationale") or item.get("reason") or ""
+                next_steps.append(f"{op} on {parents}" + (f" — {rationale}" if rationale else ""))
+            else:
+                next_steps.append(str(item))
+        for item in meta.get("unexplored_mechanisms") or []:
+            next_steps.append(f"Explore unexplored mechanism: {item}")
+        if not next_steps:
+            next_steps = [
+                "Refine top hypotheses using reflection weaknesses and recommended improvements.",
+                "Probe critical assumptions and design falsification tests.",
+            ]
 
         overview = {
-            "meta_review_critique": list(comment_summary),
+            **meta,
+            "meta_review_critique": critique,
             "research_overview": {
-                "top_ranked_hypotheses": [h.to_dict() for h in best_hypotheses],  # Use to_dict for serialization
+                "top_ranked_hypotheses": [h.to_dict() for h in best_hypotheses],
                 "suggested_next_steps": next_steps,
             },
         }
-        context.meta_review_feedback.append(overview)  # Store feedback in context
+        context.meta_review_feedback.append(overview)
         logger.info("Meta-review complete: %s", overview)
         return overview
 
@@ -919,7 +1189,12 @@ class SupervisorAgent:
         self.meta_review_agent = MetaReviewAgent()
 
     def run_cycle(self, research_goal: ResearchGoal, context: ContextMemory) -> Dict:
-        """Runs a single cycle of hypothesis generation and refinement."""
+        """Run one coherent feedback cycle.
+
+        Order: Generation → Reflection → Tournament → Meta-review → Evolution →
+        Reflection → Tournament → Proximity. Meta-review runs before evolution so
+        its strategy can control which operators/parents are used.
+        """
         logger.info("--- Starting Cycle %d ---", context.iteration_number + 1)
         cycle_details = {"iteration": context.iteration_number + 1, "steps": {}, "meta_review": {}}
 
@@ -927,69 +1202,61 @@ class SupervisorAgent:
         logger.info("Step 1: Generation")
         new_hypotheses, generation_errors = self.generation_agent.generate_new_hypotheses(research_goal, context)
         for nh in new_hypotheses:
-            context.add_hypothesis(nh)  # Add to central context
+            context.add_hypothesis(nh)
         cycle_details["steps"]["generation"] = {"hypotheses": [h.to_dict() for h in new_hypotheses]}
 
-        # Propagate LLM errors to top-level errors field for frontend display, so a
-        # generation failure surfaces its real cause instead of an empty ranking.
         if generation_errors:
             cycle_details["errors"] = generation_errors
 
-        # Get all active hypotheses for subsequent steps
         active_hypos = context.get_active_hypotheses()
 
         # 2. Reflection
         logger.info("Step 2: Reflection")
-        self.reflection_agent.review_hypotheses(active_hypos, context, research_goal)  # Pass research_goal
+        self.reflection_agent.review_hypotheses(active_hypos, context, research_goal)
         cycle_details["steps"]["reflection"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
 
         # 3. Ranking (Tournament 1)
         logger.info("Step 3: Ranking 1")
-        self.ranking_agent.run_tournament(active_hypos, context, research_goal)  # Pass research_goal
+        self.ranking_agent.run_tournament(active_hypos, context, research_goal)
         cycle_details["steps"]["ranking1"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
 
-        # 4. Evolution
-        logger.info("Step 4: Evolution")
-        evolved_hypotheses = self.evolution_agent.evolve_hypotheses(context, research_goal)  # Pass research_goal
+        # 4. Meta-review (steers evolution)
+        logger.info("Step 4: Meta-Review")
+        overview = self.meta_review_agent.summarize_and_feedback(context, adjacency=None, research_goal=research_goal)
+        cycle_details["meta_review"] = overview
+        cycle_details["steps"]["meta_review"] = overview
+
+        # 5. Evolution (uses latest meta-review on context)
+        logger.info("Step 5: Evolution")
+        evolved_hypotheses = self.evolution_agent.evolve_hypotheses(context, research_goal)
         if evolved_hypotheses:
             for eh in evolved_hypotheses:
                 context.add_hypothesis(eh)
-            logger.info("Step 4a: Reviewing Evolved Hypotheses")
-            self.reflection_agent.review_hypotheses(evolved_hypotheses, context, research_goal)  # Pass research_goal
-            active_hypos = context.get_active_hypotheses()  # Update active list
+            logger.info("Step 5a: Reviewing Evolved Hypotheses")
+            self.reflection_agent.review_hypotheses(evolved_hypotheses, context, research_goal)
+            active_hypos = context.get_active_hypotheses()
             cycle_details["steps"]["evolution"] = {"hypotheses": [h.to_dict() for h in evolved_hypotheses]}
-            # Add explicit step for reviewing evolved hypotheses AFTER evolution
             cycle_details["steps"]["reflection_evolved"] = {"hypotheses": [h.to_dict() for h in evolved_hypotheses]}
         else:
             cycle_details["steps"]["evolution"] = {"hypotheses": []}
 
-        # 5. Ranking (Tournament 2 - includes evolved)
-        logger.info("Step 5: Ranking 2")
-        self.ranking_agent.run_tournament(active_hypos, context, research_goal)  # Pass research_goal
+        # 6. Ranking (Tournament 2 - includes evolved)
+        logger.info("Step 6: Ranking 2")
+        self.ranking_agent.run_tournament(active_hypos, context, research_goal)
         cycle_details["steps"]["ranking2"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
 
-        # Ensure context.active_hypotheses reflects the final ranked hypotheses for meta-review
-        # Use all hypotheses from the final ranking step (not just active_hypos, which may be filtered)
         final_ranked_hypos = [h for h in active_hypos]
         context.active_hypotheses = {h.hypothesis_id: h for h in final_ranked_hypos}
 
-        # 6. Proximity Analysis
-        logger.info("Step 6: Proximity Analysis")
-        proximity_result = self.proximity_agent.build_proximity_graph(context)  # Pass context
+        # 7. Proximity Analysis
+        logger.info("Step 7: Proximity Analysis")
+        proximity_result = self.proximity_agent.build_proximity_graph(context)
         cycle_details["steps"]["proximity"] = {
             "adjacency_graph": proximity_result["adjacency_graph"],
             "nodes": proximity_result["nodes"],
             "edges": proximity_result["edges"],
         }
 
-        # 7. Meta-review
-        logger.info("Step 7: Meta-Review")
-        overview = self.meta_review_agent.summarize_and_feedback(context, proximity_result["adjacency_graph"])
-        cycle_details["meta_review"] = overview
-        # Add meta-review to steps for consistency
-        cycle_details["steps"]["meta_review"] = overview
-
-        # Increment iteration number at the end of the cycle
         context.iteration_number += 1
         logger.info("--- Cycle %d Complete ---", context.iteration_number)
         return cycle_details

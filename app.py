@@ -571,25 +571,44 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
                     html += "<p>No proximity data available.</p>"
 
         elif step_name == "meta_review":
-            # Debug: log the actual meta_review data structure
-            import sys
-
-            print("DEBUG: meta_review step_data =", step_data, file=sys.stderr)
             assert isinstance(step_data, dict), "meta_review step_data is not a dict"
-            # Accept both direct dict or nested under 'meta_review'
             if "meta_review" in step_data and isinstance(step_data["meta_review"], dict):
                 meta_review = step_data["meta_review"]
             else:
                 meta_review = step_data
             assert "meta_review_critique" in meta_review, f"meta_review_critique missing in meta_review: {meta_review}"
             assert "research_overview" in meta_review, f"research_overview missing in meta_review: {meta_review}"
-            # Critique section
             if meta_review.get("meta_review_critique"):
                 html += "<h5>Critique:</h5><ul>"
                 for critique in meta_review["meta_review_critique"]:
-                    html += f"<li>{critique}</li>"
+                    html += f"<li>{html_lib.escape(str(critique))}</li>"
                 html += "</ul>"
-            # Top ranked hypotheses section
+            for label, key in (
+                ("Recurring strengths", "recurring_strengths"),
+                ("Recurring weaknesses", "recurring_weaknesses"),
+                ("Unexplored mechanisms", "unexplored_mechanisms"),
+                ("Shared assumptions", "shared_assumptions"),
+                ("Contradictions", "contradictions"),
+                ("Research gaps", "research_gaps"),
+            ):
+                values = meta_review.get(key) or []
+                if values:
+                    html += f"<h5>{label}:</h5><ul>"
+                    for item in values:
+                        html += f"<li>{html_lib.escape(str(item))}</li>"
+                    html += "</ul>"
+            pairs = meta_review.get("promising_hypothesis_pairs") or []
+            if pairs:
+                html += "<h5>Promising hypothesis pairs:</h5><ul>"
+                for item in pairs:
+                    html += f"<li>{html_lib.escape(str(item))}</li>"
+                html += "</ul>"
+            strategy = meta_review.get("recommended_evolution_strategy") or []
+            if strategy:
+                html += "<h5>Recommended evolution strategy:</h5><ul>"
+                for item in strategy:
+                    html += f"<li>{html_lib.escape(str(item))}</li>"
+                html += "</ul>"
             top_hypos = meta_review.get("research_overview", {}).get("top_ranked_hypotheses", [])
             assert isinstance(top_hypos, list), f"top_ranked_hypotheses is not a list: {top_hypos}"
             if top_hypos:
@@ -604,11 +623,10 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
                         {_hypothesis_review_html(hypo)}
                     </div>
                     """
-            # Suggested next steps section
             if meta_review.get("research_overview", {}).get("suggested_next_steps"):
                 html += "<h5>Suggested Next Steps:</h5><ul>"
                 for step in meta_review["research_overview"]["suggested_next_steps"]:
-                    html += f"<li>{step}</li>"
+                    html += f"<li>{html_lib.escape(str(step))}</li>"
                 html += "</ul>"
 
         # Add timing information if available

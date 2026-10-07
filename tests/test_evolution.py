@@ -42,6 +42,10 @@ def test_call_llm_for_evolution_includes_goal_reviews_and_operator():
     )
     context.meta_review_feedback.append(
         {
+            "recurring_weaknesses": ["Some ideas lack novelty."],
+            "recommended_evolution_strategy": [
+                {"operator": "REFINE", "parent_ids": ["G1"], "rationale": "Address novelty gaps"}
+            ],
             "meta_review_critique": ["Some ideas lack novelty."],
             "research_overview": {"suggested_next_steps": ["Refine top hypotheses."]},
         }
@@ -66,6 +70,7 @@ def test_call_llm_for_evolution_includes_goal_reviews_and_operator():
     assert "Novelty: MEDIUM" in prompt
     assert "G1 is more novel." in prompt
     assert "Some ideas lack novelty." in prompt
+    assert "Latest meta-review guidance" in prompt
     assert mock_call.call_args.kwargs["model"] == "test/model"
 
 
