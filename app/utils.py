@@ -35,11 +35,25 @@ logger = logging.getLogger("aicoscientist")  # Use a specific name for the app l
 
 # --- Secret Redaction ---
 def redact_secrets(text: str) -> str:
-    """Removes the API key from text destined for logs or user-facing errors."""
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if api_key and api_key in text:
-        return text.replace(api_key, "***REDACTED***")
+    """Removes API keys from text destined for logs or user-facing errors."""
+    for variable in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+        api_key = os.getenv(variable)
+        if api_key and api_key in text:
+            text = text.replace(api_key, "***REDACTED***")
     return text
+
+
+def get_llm_provider() -> str:
+    """Return the configured LLM provider, defaulting to OpenRouter."""
+    return os.getenv("LLM_PROVIDER", str(config.get("llm_provider", "openrouter"))).strip().lower()
+
+
+def get_configured_model(provider: Optional[str] = None) -> str:
+    """Return the default model for the selected provider."""
+    provider = provider or get_llm_provider()
+    if provider == "openai":
+        return str(config.get("openai_model", "gpt-4o-mini"))
+    return str(config.get("llm_model", ""))
 
 
 # --- Error Classification ---
@@ -240,7 +254,12 @@ def _is_timeout(error_str: str) -> bool:
 
 
 def _attempt_model(
-    client: "OpenAI", model: str, prompt: str, temperature: float, max_retries: Optional[int] = None
+    client: "OpenAI",
+    model: str,
+    prompt: str,
+    temperature: float,
+    max_retries: Optional[int] = None,
+    provider_name: str = "OpenRouter",
 ) -> str:
     """Single-model call with retry/backoff. Returns the content or an
     'Error: ...' string. Model-unavailable and rate-limit outcomes use marker
@@ -270,15 +289,15 @@ def _attempt_model(
             if "401" in error_str or "No auth credentials found" in error_str:
                 logger.error(f"Authentication failed (401 Unauthorized): {error_str}")
                 return (
-                    "Authentication with OpenRouter failed (401 Unauthorized). "
-                    "Please check that your OPENROUTER_API_KEY environment variable is set and valid "
+                    f"Authentication with {provider_name} failed (401 Unauthorized). "
+                    f"Please check that your {provider_name.upper()}_API_KEY environment variable is set and valid "
                     "in the environment where the server is running. No hypotheses can be generated until this is resolved."
                 )
             if "No endpoints found" in error_str or "not a valid model" in error_str or "404" in error_str:
                 logger.error(f"Model unavailable: {error_str}")
                 return (
                     f"{_MODEL_UNAVAILABLE_PREFIX} ('{model}'). "
-                    "The selected model may have been removed from OpenRouter or is temporarily unreachable. "
+                    f"The selected model may have been removed from {provider_name} or is temporarily unreachable. "
                     "Try selecting a different model. Details: " + error_str
                 )
             if _is_rate_limit(error_str):
@@ -311,47 +330,65 @@ def call_llm(
     model: Optional[str] = None,
     fallback_models: Optional[List[str]] = None,
 ) -> str:
-    """Calls an LLM via OpenRouter, returning the response text.
+    """Call an LLM through the configured OpenRouter or OpenAI provider.
 
-    Tries the primary model (``model`` or ``config['llm_model']``) and, if it is
-    unavailable, rate-limited, or too slow, automatically falls back to working
-    free models (issue llnl#26/#32) so a single bad model does not fail every
-    run. Auth/parse/final provider errors still propagate to the caller.
+    OpenRouter automatically falls back to live free models when appropriate.
+    OpenAI uses only the selected/default OpenAI model unless explicit fallback
+    models are supplied.
     """
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    provider = get_llm_provider()
+    if provider not in {"openrouter", "openai"}:
+        logger.error("Unsupported LLM provider: %s", provider)
+        return f"Error: Unsupported LLM provider '{provider}'. Use 'openrouter' or 'openai'."
+
+    is_openai = provider == "openai"
+    provider_name = "OpenAI" if is_openai else "OpenRouter"
+    key_variable = "OPENAI_API_KEY" if is_openai else "OPENROUTER_API_KEY"
+    api_key = os.getenv(key_variable)
     if not api_key:
         # openai>=1 raises from the OpenAI() constructor on a missing key, so
         # check before constructing the client.
-        logger.error("OPENROUTER_API_KEY environment variable not set.")
-        return "Error: OpenRouter API key not set."
+        logger.error("%s environment variable not set.", key_variable)
+        return f"Error: {provider_name} API key not set."
 
     # max_retries=0 disables the OpenAI SDK's own Retry-After backoff (which can
     # block ~30s on a rate-limited free model); call_llm controls retries itself.
+    base_url = config.get("openai_base_url") if is_openai else config.get("openrouter_base_url")
     client = OpenAI(
-        base_url=config.get("openrouter_base_url"),
+        base_url=base_url,
         api_key=api_key,
         max_retries=0,
         timeout=config.get("llm_request_timeout_seconds", 30),
     )
-    primary = model or config.get("llm_model")
+    primary = model or get_configured_model(provider)
     if not primary:
         logger.error("LLM model not configured in config.yaml")
         return "Error: LLM model not configured."
 
     # Happy path: try the primary model. No fallback fetch unless it's needed.
-    result = _attempt_model(client, primary, prompt, temperature)
+    result = _attempt_model(client, primary, prompt, temperature, provider_name=provider_name)
     if not _recoverable_with_another_model(result):
         return result  # success, or a terminal error (auth) we must not mask
 
-    # Primary failed with something another model might fix (unavailable, rate
-    # limited, provider error): try working free models — the live OpenRouter
-    # list (fetched now) unless the caller passed an explicit list. Quick probes
-    # (max_retries=1) so we move past a flaky model to the next one fast.
-    logger.warning("Primary model '%s' failed (%s); trying other free models.", primary, result[:60])
-    fallbacks = fallback_models if fallback_models is not None else get_fallback_models(primary)
+    # Primary failed with something another model might fix. OpenRouter uses its
+    # live free-model list; OpenAI only uses fallbacks explicitly supplied by
+    # the caller.
+    fallbacks = fallback_models
+    if fallbacks is None:
+        fallbacks = [] if is_openai else get_fallback_models(primary)
+    if not fallbacks:
+        return result
+    logger.warning("Primary model '%s' failed (%s); trying fallback models.", primary, result[:60])
     for candidate in _model_candidates(primary, fallbacks)[1 : 1 + MAX_FALLBACK_ATTEMPTS]:
         logger.warning("Trying fallback model '%s'.", candidate)
-        result = _attempt_model(client, candidate, prompt, temperature, max_retries=1)
+        result = _attempt_model(
+            client,
+            candidate,
+            prompt,
+            temperature,
+            max_retries=1,
+            provider_name=provider_name,
+        )
         if not _recoverable_with_another_model(result):
             return result
     # Every candidate failed — surface the last error.

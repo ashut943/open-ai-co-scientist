@@ -53,3 +53,14 @@ def test_key_absent_from_error_message_shown_to_user(monkeypatch):
     # The raw exception text is propagated into the user-facing error today; if a
     # provider ever echoes the key, it must not reach the user or the logs.
     assert FAKE_KEY not in response
+
+
+def test_openai_key_absent_from_error_message(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_KEY)
+    monkeypatch.setitem(utils.config, "max_retries", 1)
+    with patch.object(utils, "OpenAI") as mock_openai:
+        mock_openai.return_value.chat.completions.create.side_effect = Exception(f"boom {FAKE_KEY} leaked")
+        response = utils.call_llm("prompt")
+
+    assert FAKE_KEY not in response

@@ -6,7 +6,12 @@ __pycache__
 results/app_log_*.txt
 results
 .worktree/
+# Local secrets and provider credentials
 .env
+.env.*
+!.env.example
+.secrets/
+secrets/
 .audit/
 .loop/
 .cache/

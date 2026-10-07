@@ -132,6 +132,17 @@ def test_hf_spaces_model_list_uses_dynamic_free_model_cache(gradio_app_module, m
     mock_get.assert_not_called()
 
 
+def test_openai_model_list_uses_configured_model_without_openrouter_request(gradio_app_module, monkeypatch):
+    monkeypatch.setattr(gradio_app_module, "LLM_PROVIDER", "openai")
+    monkeypatch.setattr(gradio_app_module, "CONFIGURED_LLM_MODEL", "gpt-4o-mini")
+
+    with patch.object(gradio_app_module.requests, "get") as mock_get:
+        models = gradio_app_module.fetch_available_models()
+
+    assert models == ["gpt-4o-mini"]
+    mock_get.assert_not_called()
+
+
 def test_run_cycle_with_progress_streams_active_status(gradio_app_module, monkeypatch, tmp_path):
     from app.models import ContextMemory, ResearchGoal
     from app.run_store import RUNS_DIR_ENV

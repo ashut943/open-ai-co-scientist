@@ -13,8 +13,10 @@ git clone --branch main --single-branch https://github.com/chunhualiao/co-scient
 cd ~/workspace/open-ai-co-scientist-local-deploy
 ```
 
-Provide `OPENROUTER_API_KEY` through the environment. For local-only testing, a
-symlink to an existing gitignored `.env` is fine:
+Provide the selected provider and its API key through the environment
+(`LLM_PROVIDER=openrouter` with `OPENROUTER_API_KEY`, or
+`LLM_PROVIDER=openai` with `OPENAI_API_KEY`). For local-only testing, a symlink
+to an existing gitignored `.env` is fine:
 
 ```bash
 ln -s ~/workspace/open-ai-co-scientist/.env .env

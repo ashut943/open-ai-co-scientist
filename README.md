@@ -53,13 +53,18 @@ In accordance with LLNL policy on Generative Artificial Intelligence, this proje
     pip install -r requirements.txt
     ```
 
-3. **Set up your OpenRouter API key:**
-    - Sign up at [https://openrouter.ai/](https://openrouter.ai/) and obtain an API key.
-    - Add at least $5 to your OpenRouter account balance (or use a free model if available).
-    - Set the environment variable:
+3. **Choose an LLM provider and set its API key:**
+    - OpenRouter (default):
       ```bash
+      export LLM_PROVIDER=openrouter
       export OPENROUTER_API_KEY=your_api_key
       ```
+    - Or use OpenAI directly:
+      ```bash
+      export LLM_PROVIDER=openai
+      export OPENAI_API_KEY=your_api_key
+      ```
+      OpenAI API usage is billed separately from ChatGPT or Codex subscriptions.
 
 4. **Run the Gradio app:**
     ```bash

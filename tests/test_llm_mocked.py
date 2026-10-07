@@ -75,6 +75,49 @@ def test_missing_key_short_circuits_without_call(monkeypatch):
     assert "key" in response.lower()
 
 
+def test_openai_provider_uses_openai_key_endpoint_and_model(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-key")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    with patch.object(utils, "OpenAI") as mock_openai:
+        mock_openai.return_value.chat.completions.create.return_value = _completion("response")
+        response = utils.call_llm("prompt")
+
+    assert response == "response"
+    assert mock_openai.call_args.kwargs["api_key"] == "fake-openai-key"
+    assert mock_openai.call_args.kwargs["base_url"] == "https://api.openai.com/v1"
+    assert mock_openai.return_value.chat.completions.create.call_args.kwargs["model"] == "gpt-4o-mini"
+
+
+def test_openai_provider_requires_openai_key(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key-is-not-valid-here")
+
+    with patch.object(utils, "OpenAI") as mock_openai:
+        response = utils.call_llm("prompt")
+
+    assert response == "Error: OpenAI API key not set."
+    mock_openai.assert_not_called()
+
+
+def test_openai_provider_does_not_fetch_openrouter_fallbacks(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-key")
+    monkeypatch.setitem(utils.config, "max_retries", 1)
+
+    with (
+        patch.object(utils, "fetch_free_models") as mock_fetch,
+        patch.object(utils, "OpenAI") as mock_openai,
+    ):
+        mock_openai.return_value.chat.completions.create.side_effect = Exception("No endpoints found")
+        response = utils.call_llm("prompt")
+
+    assert utils.classify_llm_error(response) == "Model unavailable or delisted"
+    mock_fetch.assert_not_called()
+
+
 def test_reflection_error_returns_not_reviewed(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key-for-test")
     # call_llm is imported into app.agents' namespace, so patch it there.

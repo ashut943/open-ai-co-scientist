@@ -1,10 +1,7 @@
 # Configuration file for proposal-gen-v1.py
 
-# OpenAI API Key (REQUIRED)
-# Obtain an API key from OpenRouter (https://openrouter.ai) and set it as an environment variable:
-#   export OPENROUTER_API_KEY=your_api_key
-# Or, you can paste your key directly below (not recommended for production):
-#openai_api_key: ""
+# Provider can also be overridden with LLM_PROVIDER=openrouter or openai.
+llm_provider: "openrouter"
 
 # OpenRouter API Base URL
 openrouter_base_url: "https://openrouter.ai/api/v1"
@@ -13,6 +10,11 @@ openrouter_base_url: "https://openrouter.ai/api/v1"
 # finish a full multi-call cycle within its UI timeout. If this one is delisted,
 # rate-limited, or too slow, call_llm auto-falls back to other live free models.
 llm_model: "meta-llama/llama-3.2-3b-instruct:free"
+
+# Direct OpenAI settings, used when LLM_PROVIDER=openai.
+# openai_base_url: "https://api.openai.com/v1"
+openai_base_url: "https://parley.api.mit.edu/v1"
+openai_model: "gpt-4o-mini"
 
 # Number of hypotheses to generate
 num_hypotheses: 4

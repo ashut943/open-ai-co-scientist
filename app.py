@@ -18,7 +18,9 @@ from app.tools.arxiv_search import ArxivSearchTool
 from app.utils import (
     classify_llm_error,
     fetch_free_models,
+    get_configured_model,
     get_deployment_environment,
+    get_llm_provider,
     is_huggingface_space,
     logger,
     order_free_models_for_demo,
@@ -29,7 +31,8 @@ global_context = ContextMemory()
 supervisor = SupervisorAgent()
 current_research_goal: Optional[ResearchGoal] = None
 available_models: List[str] = []
-CONFIGURED_LLM_MODEL = config.get("llm_model", "")
+LLM_PROVIDER = get_llm_provider()
+CONFIGURED_LLM_MODEL = get_configured_model(LLM_PROVIDER)
 SAFE_FALLBACK_LLM_MODEL = CONFIGURED_LLM_MODEL or "-- Select Model --"
 CYCLE_TIMEOUT_SECONDS = int(os.getenv("CO_SCIENTIST_CYCLE_TIMEOUT_SECONDS", "300"))
 CYCLE_PROGRESS_INTERVAL_SECONDS = 5
@@ -39,8 +42,12 @@ logging.basicConfig(level=logging.INFO)
 
 
 def fetch_available_models():
-    """Fetch available models from OpenRouter with environment-based filtering."""
+    """Return models appropriate for the configured provider."""
     global available_models
+
+    if LLM_PROVIDER == "openai":
+        available_models = [CONFIGURED_LLM_MODEL] if CONFIGURED_LLM_MODEL else []
+        return available_models
 
     # Detect deployment environment
     deployment_env = get_deployment_environment()
@@ -78,6 +85,8 @@ def fetch_available_models():
 def get_default_model_choice(models: Optional[List[str]] = None) -> str:
     """Prefer the configured free model when live, then a fast free model."""
     model_choices = models or available_models
+    if LLM_PROVIDER == "openai":
+        return CONFIGURED_LLM_MODEL or SAFE_FALLBACK_LLM_MODEL
     if (
         CONFIGURED_LLM_MODEL
         and ":free" in CONFIGURED_LLM_MODEL
@@ -104,6 +113,9 @@ def get_deployment_status():
     """Get deployment status information."""
     deployment_env = get_deployment_environment()
     is_hf_spaces = is_huggingface_space()
+
+    if LLM_PROVIDER == "openai":
+        return f"💻 Running in {deployment_env} | Provider: OpenAI", "blue"
 
     if is_hf_spaces:
         status = (
@@ -745,7 +757,12 @@ def create_gradio_interface():
                         choices=get_model_dropdown_choices(),
                         value=default_model,
                         label=f"LLM Model (default: {default_model})",
-                        info="Compact free models are recommended first so demo runs finish faster.",
+                        info=(
+                            "Enter an OpenAI model ID, or use the configured default."
+                            if LLM_PROVIDER == "openai"
+                            else "Compact free models are recommended first so demo runs finish faster."
+                        ),
+                        allow_custom_value=LLM_PROVIDER == "openai",
                     )
 
                     with gr.Row():
@@ -931,8 +948,9 @@ def create_gradio_interface():
 
 if __name__ == "__main__":
     # Check for API key
-    if not os.getenv("OPENROUTER_API_KEY"):
-        print("⚠️  Warning: OPENROUTER_API_KEY environment variable not set.")
+    key_variable = "OPENAI_API_KEY" if LLM_PROVIDER == "openai" else "OPENROUTER_API_KEY"
+    if not os.getenv(key_variable):
+        print(f"⚠️  Warning: {key_variable} environment variable not set.")
         print("The app will start but may not function properly without an API key.")
 
     # Create and launch the Gradio app
