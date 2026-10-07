@@ -395,6 +395,42 @@ def run_cycle_with_progress(
     yield persist_cycle_result(run_goal, cycle_result)
 
 
+def _hypothesis_review_html(hypo: Dict[str, Any]) -> str:
+    """Compact HTML for structured reflection fields on a hypothesis dict."""
+    import html as html_lib
+
+    scores = hypo.get("review_scores") or {}
+    score_bits = ", ".join(
+        f"{html_lib.escape(str(k).replace('_', ' '))}: {html_lib.escape(str(v))}" for k, v in scores.items() if v
+    )
+    parts = [
+        f"<p><strong>Novelty:</strong> {html_lib.escape(str(hypo.get('novelty_review', 'Not assessed')))} | "
+        f"<strong>Feasibility:</strong> {html_lib.escape(str(hypo.get('feasibility_review', 'Not assessed')))}</p>"
+    ]
+    if score_bits:
+        parts.append(f"<p><strong>Scores:</strong> {score_bits}</p>")
+    for label, key in (
+        ("Strengths", "review_strengths"),
+        ("Weaknesses", "review_weaknesses"),
+        ("Critical assumptions", "critical_assumptions"),
+        ("Falsification conditions", "falsification_conditions"),
+        ("Safety / ethics", "safety_ethical_concerns"),
+        ("Recommended improvements", "recommended_improvements"),
+    ):
+        values = hypo.get(key) or []
+        if values:
+            items = "".join(f"<li>{html_lib.escape(str(v))}</li>" for v in values)
+            parts.append(f"<p><strong>{label}:</strong></p><ul>{items}</ul>")
+    comments = hypo.get("review_comments") or hypo.get("comments")
+    if comments:
+        if isinstance(comments, list):
+            comment_text = "; ".join(str(c) for c in comments)
+        else:
+            comment_text = str(comments)
+        parts.append(f"<p><strong>Comments:</strong> {html_lib.escape(comment_text)}</p>")
+    return "".join(parts)
+
+
 def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
     """Format cycle results as HTML with expandable sections. Optionally log final rankings to log_file."""
     import html as html_lib
@@ -459,9 +495,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
                 html += f"""
                 <div style="border-left: 3px solid #17a2b8; padding-left: 10px; margin: 10px 0;">
                     <h5>{hypo.get("title", "Untitled")} (ID: {hypo.get("id", "Unknown")})</h5>
-                    <p><strong>Novelty:</strong> {hypo.get("novelty_review", "Not assessed")} | 
-                       <strong>Feasibility:</strong> {hypo.get("feasibility_review", "Not assessed")}</p>
-                    {f"<p><strong>Comments:</strong> {hypo.get('comments', 'No comments')}</p>" if hypo.get("comments") else ""}
+                    {_hypothesis_review_html(hypo)}
                 </div>
                 """
 
@@ -483,7 +517,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
 
         elif step_name == "evolution":
             hypotheses = step_data.get("hypotheses", [])
-            html += f"<p><strong>Evolved {len(hypotheses)} new hypotheses by combining top performers:</strong></p>"
+            html += f"<p><strong>Evolved {len(hypotheses)} new child hypotheses (refine/mutate/simplify/hybridize):</strong></p>"
             for hypo in hypotheses:
                 html += f"""
                 <div style="border-left: 3px solid #ffc107; padding-left: 10px; margin: 10px 0;">
@@ -567,8 +601,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
                         <p><strong>ID:</strong> {hypo.get("id", "Unknown")} | 
                            <strong>Elo Score:</strong> {hypo.get("elo_score", 0):.2f}</p>
                         <p><strong>Description:</strong> {hypo.get("text", "No description")}</p>
-                        <p><strong>Novelty:</strong> {hypo.get("novelty_review", "Not assessed")} | 
-                           <strong>Feasibility:</strong> {hypo.get("feasibility_review", "Not assessed")}</p>
+                        {_hypothesis_review_html(hypo)}
                     </div>
                     """
             # Suggested next steps section
@@ -645,8 +678,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
                 <p><strong>ID:</strong> {hypo.get("id", "Unknown")} | 
                    <strong>Elo Score:</strong> {hypo.get("elo_score", 0):.2f}</p>
                 <p><strong>Description:</strong> {hypo.get("text", "No description")}</p>
-                <p><strong>Novelty:</strong> {hypo.get("novelty_review", "Not assessed")} | 
-                   <strong>Feasibility:</strong> {hypo.get("feasibility_review", "Not assessed")}</p>
+                {_hypothesis_review_html(hypo)}
             </div>
             """
 

@@ -4,7 +4,7 @@ import random
 from typing import Dict, List, Tuple
 
 # Import necessary components from other modules
-from .models import ContextMemory, Hypothesis, ResearchGoal
+from .models import REVIEW_SCORE_KEYS, ContextMemory, Hypothesis, ResearchGoal
 from .utils import (
     call_llm,
     generate_unique_id,
@@ -62,71 +62,172 @@ def call_llm_for_generation(
         return [{"title": "Error", "text": f"Could not parse LLM response: {e}"}]
 
 
-# Updated signature to accept temperature
-def call_llm_for_reflection(hypothesis_text: str, temperature: float = 0.5, model: str | None = None) -> Dict:
-    """Calls LLM for reviewing a hypothesis, handling JSON parsing."""
+def _empty_review_scores() -> Dict[str, int]:
+    return {key: 0 for key in REVIEW_SCORE_KEYS}
+
+
+def _score_to_ordinal(score: int | None) -> str:
+    """Map a 1-5 review score to the legacy HIGH/MEDIUM/LOW ordinal."""
+    if score is None or score <= 0:
+        return "Not reviewed"
+    if score <= 2:
+        return "LOW"
+    if score == 3:
+        return "MEDIUM"
+    return "HIGH"
+
+
+def _coerce_score(value) -> int | None:
+    try:
+        score = int(value)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= score <= 5:
+        return score
+    return None
+
+
+def _coerce_str_list(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                items.append(item.strip())
+            elif item is not None:
+                items.append(str(item))
+        return items
+    return [str(value)]
+
+
+def call_llm_for_reflection(
+    hypothesis_text: str,
+    temperature: float = 0.5,
+    model: str | None = None,
+    research_goal: str | None = None,
+) -> Dict:
+    """Peer-review a hypothesis with numeric criterion scores and structured critique."""
     logger.info("LLM reflection called with temperature: %.2f", temperature)
+    goal_block = research_goal.strip() if research_goal else "Not provided."
+    criteria = ", ".join(REVIEW_SCORE_KEYS)
     prompt = (
-        f"Review the following hypothesis and provide a novelty assessment (HIGH, MEDIUM, or LOW), "
-        f"a feasibility assessment (HIGH, MEDIUM, or LOW), a comment, and a list of relevant references in JSON format:\n\n"
-        f"Hypothesis: {hypothesis_text}\n\n"
-        f"For references, provide arXiv IDs (e.g., '2301.12345'), DOIs, or paper titles with venues that are relevant to this hypothesis. "
-        f"Do not provide PubMed IDs (PMIDs) unless this is specifically a biomedical/life sciences hypothesis.\n\n"
-        f"Return the response as a JSON object with the following keys: 'novelty_review', 'feasibility_review', 'comment', 'references'."
+        f"You are a scientific peer reviewer.\n\n"
+        f"Research goal:\n{goal_block}\n\n"
+        f"Hypothesis:\n{hypothesis_text}\n\n"
+        f"Score the hypothesis from 1-5 on each criterion: {criteria}.\n"
+        f"Also identify strengths, weaknesses, critical assumptions, falsification "
+        f"conditions (what observation/experiment would refute it), safety/ethical "
+        f"concerns, and recommended improvements.\n\n"
+        f"For references, provide arXiv IDs (e.g., '2301.12345'), DOIs, or paper "
+        f"titles with venues. Do not provide PubMed IDs unless this is specifically "
+        f"a biomedical/life-sciences hypothesis.\n\n"
+        f"Return ONLY a JSON object with keys:\n"
+        f'  "review_scores": object with keys {list(REVIEW_SCORE_KEYS)} and integer values 1-5,\n'
+        f'  "review_strengths": list of strings,\n'
+        f'  "review_weaknesses": list of strings,\n'
+        f'  "critical_assumptions": list of strings,\n'
+        f'  "falsification_conditions": list of strings,\n'
+        f'  "safety_ethical_concerns": list of strings,\n'
+        f'  "recommended_improvements": list of strings,\n'
+        f'  "comment": brief overall summary string,\n'
+        f'  "references": list of strings.\n'
     )
-    # Pass the received temperature down to the actual LLM call
     response = call_llm(prompt, temperature=temperature, model=model)
     logger.info("LLM reflection response for hypothesis: %s", response)
 
-    if response.startswith("Error:"):
+    if response.startswith("Error:") or response.startswith("Authentication with"):
         logger.error(f"LLM reflection call failed: {response}")
         return {
             "novelty_review": "Not reviewed",
             "feasibility_review": "Not reviewed",
+            "review_scores": _empty_review_scores(),
+            "review_strengths": [],
+            "review_weaknesses": [],
+            "critical_assumptions": [],
+            "falsification_conditions": [],
+            "safety_ethical_concerns": [],
+            "recommended_improvements": [],
             "comment": f"LLM review failed: {response}",
             "references": [],
         }
 
-    # Default values
     review_data = {
         "novelty_review": "MEDIUM",
         "feasibility_review": "MEDIUM",
+        "review_scores": _empty_review_scores(),
+        "review_strengths": [],
+        "review_weaknesses": [],
+        "critical_assumptions": [],
+        "falsification_conditions": [],
+        "safety_ethical_concerns": [],
+        "recommended_improvements": [],
         "comment": "Could not parse LLM response.",
         "references": [],
     }
 
     try:
-        response = response.strip()
-        if response.startswith("```json"):
-            response = response[7:]
-        if response.endswith("```"):
-            response = response[:-3]
-        response = response.strip()
+        parsed_data = json.loads(_strip_json_fences(response))
+        raw_scores = parsed_data.get("review_scores", {})
+        if not isinstance(raw_scores, dict):
+            raw_scores = {}
+        scores: Dict[str, int] = {}
+        for key in REVIEW_SCORE_KEYS:
+            coerced = _coerce_score(raw_scores.get(key))
+            if coerced is not None:
+                scores[key] = coerced
+            else:
+                # Accept legacy HIGH/MEDIUM/LOW keys if a model still emits them.
+                legacy_key = f"{key}_review" if key in {"novelty", "feasibility"} else None
+                legacy_val = None
+                if legacy_key:
+                    legacy_val = parsed_data.get(legacy_key)
+                if key == "novelty":
+                    legacy_val = legacy_val or parsed_data.get("novelty_review")
+                if key == "feasibility":
+                    legacy_val = legacy_val or parsed_data.get("feasibility_review")
+                if isinstance(legacy_val, str):
+                    mapping = {"HIGH": 5, "MEDIUM": 3, "LOW": 1}
+                    scores[key] = mapping.get(legacy_val.upper(), 0)
+                else:
+                    scores[key] = 0
+        review_data["review_scores"] = scores
+        review_data["novelty_review"] = _score_to_ordinal(scores.get("novelty"))
+        review_data["feasibility_review"] = _score_to_ordinal(scores.get("feasibility"))
 
-        parsed_data = json.loads(response)
+        for list_key in (
+            "review_strengths",
+            "review_weaknesses",
+            "critical_assumptions",
+            "falsification_conditions",
+            "safety_ethical_concerns",
+            "recommended_improvements",
+        ):
+            review_data[list_key] = _coerce_str_list(parsed_data.get(list_key))
 
-        # Update defaults with parsed data, performing basic validation
-        novelty = parsed_data.get("novelty_review", "MEDIUM").upper()
-        if novelty in ["HIGH", "MEDIUM", "LOW"]:
-            review_data["novelty_review"] = novelty
-        else:
-            logger.warning("Invalid novelty review value received: %s", novelty)
+        comment = parsed_data.get("comment", "No comment provided.")
+        review_data["comment"] = comment if isinstance(comment, str) else str(comment)
+        references = parsed_data.get("references", [])
+        review_data["references"] = references if isinstance(references, list) else []
 
-        feasibility = parsed_data.get("feasibility_review", "MEDIUM").upper()
-        if feasibility in ["HIGH", "MEDIUM", "LOW"]:
-            review_data["feasibility_review"] = feasibility
-        else:
-            logger.warning("Invalid feasibility review value received: %s", feasibility)
+        # Legacy-only payloads: allow ordinal novelty/feasibility without review_scores.
+        if not any(scores.values()):
+            novelty = str(parsed_data.get("novelty_review", "MEDIUM")).upper()
+            feasibility = str(parsed_data.get("feasibility_review", "MEDIUM")).upper()
+            if novelty in {"HIGH", "MEDIUM", "LOW"}:
+                review_data["novelty_review"] = novelty
+                scores["novelty"] = {"HIGH": 5, "MEDIUM": 3, "LOW": 1}[novelty]
+            if feasibility in {"HIGH", "MEDIUM", "LOW"}:
+                review_data["feasibility_review"] = feasibility
+                scores["feasibility"] = {"HIGH": 5, "MEDIUM": 3, "LOW": 1}[feasibility]
+            review_data["review_scores"] = scores
 
-        review_data["comment"] = parsed_data.get("comment", "No comment provided.")
-        review_data["references"] = parsed_data.get("references", [])
-        if not isinstance(review_data["references"], list):
-            logger.warning("Invalid references format received: %s", review_data["references"])
-            review_data["references"] = []
-
-    except (json.JSONDecodeError, AttributeError, KeyError) as e:
+    except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as e:
         logger.warning("Error parsing LLM reflection response: %s", response, exc_info=True)
-        review_data["comment"] = f"Could not parse LLM response: {e}"  # Update comment with error
+        review_data["comment"] = f"Could not parse LLM response: {e}"
 
     logger.info("Parsed reflection data: %s", review_data)
     return review_data
@@ -136,22 +237,38 @@ def call_llm_for_reflection(hypothesis_text: str, temperature: float = 0.5, mode
 
 
 def _format_hypothesis_reviews(hypothesis: Hypothesis) -> str:
-    """Serialize prior reflection reviews for the tournament judge prompt."""
+    """Serialize prior reflection reviews for tournament/evolution prompts."""
     parts = []
+    if hypothesis.review_scores:
+        scored = ", ".join(f"{k}={v}" for k, v in hypothesis.review_scores.items() if v)
+        if scored:
+            parts.append(f"Scores: {scored}")
     if hypothesis.novelty_review:
         parts.append(f"Novelty: {hypothesis.novelty_review}")
     if hypothesis.feasibility_review:
         parts.append(f"Feasibility: {hypothesis.feasibility_review}")
+    if hypothesis.critical_assumptions:
+        parts.append("Critical assumptions: " + "; ".join(hypothesis.critical_assumptions))
+    if hypothesis.falsification_conditions:
+        parts.append("Falsification conditions: " + "; ".join(hypothesis.falsification_conditions))
+    if hypothesis.review_weaknesses:
+        parts.append("Weaknesses: " + "; ".join(hypothesis.review_weaknesses))
+    if hypothesis.safety_ethical_concerns:
+        parts.append("Safety/ethics: " + "; ".join(hypothesis.safety_ethical_concerns))
+    if hypothesis.recommended_improvements:
+        parts.append("Recommended improvements: " + "; ".join(hypothesis.recommended_improvements))
     if hypothesis.review_comments:
         parts.append(f"Comments: {'; '.join(hypothesis.review_comments)}")
     return "\n".join(parts) if parts else "No prior reviews available."
 
 
 def _score_based_winner(hypoA: Hypothesis, hypoB: Hypothesis) -> Hypothesis:
-    """Fallback judge: sum novelty + feasibility ordinals (legacy LLNL behavior)."""
-    mapping = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, None: 0, "ERROR": 0}
+    """Fallback judge: prefer summed 1-5 review_scores; else novelty+feasibility ordinals."""
+    mapping = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, None: 0, "ERROR": 0, "NOT REVIEWED": 0}
 
     def score(h: Hypothesis) -> int:
+        if h.review_scores and any(h.review_scores.values()):
+            return sum(int(v) for v in h.review_scores.values() if isinstance(v, int))
         score_novelty = mapping.get(h.novelty_review, 0) if isinstance(h.novelty_review, str) else 0
         score_feasibility = mapping.get(h.feasibility_review, 0) if isinstance(h.feasibility_review, str) else 0
         return score_novelty + score_feasibility
@@ -585,29 +702,35 @@ class ReflectionAgent:
     def review_hypotheses(
         self, hypotheses: List[Hypothesis], context: ContextMemory, research_goal: ResearchGoal
     ) -> None:
-        """Reviews hypotheses using LLM, based on research_goal settings."""
-        # Use reflection temperature from research_goal
+        """Peer-review hypotheses with structured scores and scientific critique."""
         reflect_temp = research_goal.reflection_temperature
 
         for h in hypotheses:
-            # Avoid re-reviewing if already reviewed (optional optimization)
-            # if h.novelty_review is not None and h.feasibility_review is not None:
-            #    continue
-            # Pass the specific temperature
-            result = call_llm_for_reflection(h.text, temperature=reflect_temp, model=research_goal.llm_model)
+            result = call_llm_for_reflection(
+                h.text,
+                temperature=reflect_temp,
+                model=research_goal.llm_model,
+                research_goal=research_goal.description,
+            )
             h.novelty_review = result["novelty_review"]
             h.feasibility_review = result["feasibility_review"]
-            # Append comment only if it's not the default error message
-            if result["comment"] != "Could not parse LLM response.":
+            h.review_scores = result.get("review_scores") or {}
+            h.review_strengths = result.get("review_strengths") or []
+            h.review_weaknesses = result.get("review_weaknesses") or []
+            h.critical_assumptions = result.get("critical_assumptions") or []
+            h.falsification_conditions = result.get("falsification_conditions") or []
+            h.safety_ethical_concerns = result.get("safety_ethical_concerns") or []
+            h.recommended_improvements = result.get("recommended_improvements") or []
+            if result["comment"] not in {"Could not parse LLM response.", ""}:
                 h.review_comments.append(result["comment"])
-            # Only extend references if the list is not empty
             if result["references"]:
                 h.references.extend(result["references"])
             logger.info(
-                "Reviewed hypothesis: %s, Novelty: %s, Feasibility: %s",
+                "Reviewed hypothesis: %s, Novelty: %s, Feasibility: %s, Scores: %s",
                 h.hypothesis_id,
                 h.novelty_review,
                 h.feasibility_review,
+                h.review_scores,
             )
 
 
@@ -749,19 +872,23 @@ class MetaReviewAgent:
 
         comment_summary = set()
         for h in active_hypotheses:
-            # Example critique based on reviews
-            if h.novelty_review == "LOW":
+            if h.novelty_review == "LOW" or (h.review_scores.get("novelty") or 0) <= 2:
                 comment_summary.add("Some ideas lack novelty.")
-            if h.feasibility_review == "LOW":
+            if h.feasibility_review == "LOW" or (h.review_scores.get("feasibility") or 0) <= 2:
                 comment_summary.add("Some ideas may have low feasibility.")
-            # Could add critiques based on adjacency graph (e.g., clusters, outliers)
+            if (h.review_scores.get("testability") or 0) <= 2:
+                comment_summary.add("Some ideas are weakly testable or hard to falsify.")
+            if h.safety_ethical_concerns:
+                comment_summary.add("Safety or ethical concerns were raised for one or more hypotheses.")
+            if h.critical_assumptions:
+                comment_summary.add("Critical assumptions should be examined before investing further.")
 
         best_hypotheses = sorted(active_hypotheses, key=lambda h: h.elo_score, reverse=True)[:3]
         logger.info("Top hypotheses for meta-review: %s", [h.hypothesis_id for h in best_hypotheses])
 
-        # Example suggested next steps
         next_steps = [
-            "Refine top hypotheses based on review comments.",
+            "Refine top hypotheses using recommended improvements and weaknesses from reflection.",
+            "Probe critical assumptions and design tests aimed at falsification conditions.",
             "Consider exploring areas with fewer, less connected hypotheses (if any).",
             "Seek external expert feedback on top candidates.",
         ]

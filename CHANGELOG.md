@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Reflection now returns a peer-review schema with 1-5 scores (soundness,
+  novelty, relevance, feasibility, testability, clarity, impact) plus
+  strengths/weaknesses, critical assumptions, falsification conditions,
+  safety/ethical concerns, and recommended improvements. Legacy
+  HIGH/MEDIUM/LOW novelty and feasibility fields are derived from those scores.
 - Evolution no longer string-concatenates top hypotheses. The Evolution agent
   creates **new child** hypotheses (via `parent_ids`, never in-place mutation)
   using LLM operators: REFINE, MUTATE, SIMPLIFY on the top-ranked idea, and

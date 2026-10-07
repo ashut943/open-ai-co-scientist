@@ -301,6 +301,21 @@ def _final_hypotheses(steps: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _hypothesis_block(index: int, hypothesis: Dict[str, Any]) -> str:
     comments = hypothesis.get("review_comments") or []
     comments_html = "".join(f"<li>{_escape(comment)}</li>" for comment in comments)
+    scores = hypothesis.get("review_scores") or {}
+    score_bits = ", ".join(f"{_escape(k)}={_escape(v)}" for k, v in scores.items() if v)
+    scores_html = f"<p><strong>Scores:</strong> {score_bits}</p>" if score_bits else ""
+    detail_sections = []
+    for label, key in (
+        ("Critical assumptions", "critical_assumptions"),
+        ("Falsification conditions", "falsification_conditions"),
+        ("Safety / ethics", "safety_ethical_concerns"),
+        ("Recommended improvements", "recommended_improvements"),
+    ):
+        values = hypothesis.get(key) or []
+        if values:
+            items = "".join(f"<li>{_escape(v)}</li>" for v in values)
+            detail_sections.append(f"<p><strong>{label}:</strong></p><ul>{items}</ul>")
+    details_html = "".join(detail_sections)
     return (
         '<div class="hypothesis">'
         f"<h3>{index}. {_escape(hypothesis.get('title'), 'Untitled')}</h3>"
@@ -309,6 +324,8 @@ def _hypothesis_block(index: int, hypothesis: Dict[str, Any]) -> str:
         f"<p>{_escape(hypothesis.get('text'))}</p>"
         f"<p><strong>Novelty:</strong> {_escape(hypothesis.get('novelty_review'))} | "
         f"<strong>Feasibility:</strong> {_escape(hypothesis.get('feasibility_review'))}</p>"
+        f"{scores_html}"
+        f"{details_html}"
         f"<ul>{comments_html}</ul>"
         "</div>"
     )

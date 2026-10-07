@@ -16,13 +16,32 @@ from .config import config
 ###############################################################################
 
 
+REVIEW_SCORE_KEYS = (
+    "scientific_soundness",
+    "novelty",
+    "relevance",
+    "feasibility",
+    "testability",
+    "clarity",
+    "potential_impact",
+)
+
+
 class Hypothesis:
     def __init__(self, hypothesis_id: str, title: str, text: str):
         self.hypothesis_id = hypothesis_id
         self.title = title
         self.text = text
+        # Legacy ordinals derived from review_scores for backward-compatible UI/meta-review.
         self.novelty_review: Optional[str] = None  # "HIGH", "MEDIUM", "LOW"
         self.feasibility_review: Optional[str] = None
+        self.review_scores: Dict[str, int] = {}  # criterion -> 1-5
+        self.review_strengths: List[str] = []
+        self.review_weaknesses: List[str] = []
+        self.critical_assumptions: List[str] = []
+        self.falsification_conditions: List[str] = []
+        self.safety_ethical_concerns: List[str] = []
+        self.recommended_improvements: List[str] = []
         self.elo_score: float = 1200.0  # initial Elo score
         self.review_comments: List[str] = []
         self.references: List[str] = []
@@ -37,6 +56,13 @@ class Hypothesis:
             "text": self.text,
             "novelty_review": self.novelty_review,
             "feasibility_review": self.feasibility_review,
+            "review_scores": self.review_scores,
+            "review_strengths": self.review_strengths,
+            "review_weaknesses": self.review_weaknesses,
+            "critical_assumptions": self.critical_assumptions,
+            "falsification_conditions": self.falsification_conditions,
+            "safety_ethical_concerns": self.safety_ethical_concerns,
+            "recommended_improvements": self.recommended_improvements,
             "elo_score": self.elo_score,
             "review_comments": self.review_comments,
             "references": self.references,
@@ -125,6 +151,13 @@ class HypothesisResponse(BaseModel):
     text: str
     novelty_review: Optional[str]
     feasibility_review: Optional[str]
+    review_scores: Optional[Dict[str, int]] = None
+    review_strengths: Optional[List[str]] = None
+    review_weaknesses: Optional[List[str]] = None
+    critical_assumptions: Optional[List[str]] = None
+    falsification_conditions: Optional[List[str]] = None
+    safety_ethical_concerns: Optional[List[str]] = None
+    recommended_improvements: Optional[List[str]] = None
     elo_score: float
     review_comments: List[str]
     references: List[str]

@@ -132,14 +132,28 @@ def test_reflection_error_returns_not_reviewed(monkeypatch):
 
     assert review["novelty_review"] == "Not reviewed"
     assert review["feasibility_review"] == "Not reviewed"
+    assert review["critical_assumptions"] == []
     assert review["references"] == []
 
 
 def test_reflection_passes_selected_model_to_llm_boundary():
     payload = json.dumps(
         {
-            "novelty_review": "HIGH",
-            "feasibility_review": "MEDIUM",
+            "review_scores": {
+                "scientific_soundness": 4,
+                "novelty": 5,
+                "relevance": 4,
+                "feasibility": 3,
+                "testability": 4,
+                "clarity": 4,
+                "potential_impact": 3,
+            },
+            "review_strengths": ["Clear"],
+            "review_weaknesses": [],
+            "critical_assumptions": ["Stable supply"],
+            "falsification_conditions": ["Null result in pilot"],
+            "safety_ethical_concerns": [],
+            "recommended_improvements": ["Add controls"],
             "comment": "Looks plausible.",
             "references": [],
         }
@@ -148,4 +162,5 @@ def test_reflection_passes_selected_model_to_llm_boundary():
         review = call_llm_for_reflection("some hypothesis", model="gpt-5-mini")
 
     assert review["novelty_review"] == "HIGH"
+    assert review["critical_assumptions"] == ["Stable supply"]
     assert mock_call.call_args.kwargs["model"] == "gpt-5-mini"
