@@ -114,7 +114,9 @@ def _step_llm(**failing):
     return fake
 
 
-def _run_cycle(fake_llm):
+def _run_two_cycles(fake_llm):
+    """Evolution only runs from cycle 2 (it follows the previous meta-review)."""
+    supervisor, context = SupervisorAgent(), ContextMemory()
     with (
         patch("app.agents.call_llm", side_effect=fake_llm),
         patch(
@@ -122,14 +124,13 @@ def _run_cycle(fake_llm):
             return_value={"adjacency_graph": {}, "nodes": [], "edges": []},
         ),
     ):
-        return SupervisorAgent().run_cycle(_goal(), ContextMemory())
+        return [supervisor.run_cycle(_goal(), context) for _ in range(2)]
 
 
 def test_run_cycle_no_errors_key_on_success():
-    details = _run_cycle(_step_llm())
-
-    assert "errors" not in details or not details["errors"]
-    assert details["steps"]["generation"]["hypotheses"]
+    for details in _run_two_cycles(_step_llm()):
+        assert "errors" not in details or not details["errors"]
+        assert details["steps"]["generation"]["hypotheses"]
 
 
 @pytest.mark.parametrize(
@@ -145,12 +146,12 @@ def test_run_cycle_surfaces_failures_after_generation(step, marker):
     """A failing later step must reach cycle_details["errors"] even though the
     cycle keeps going with a fallback, so the UI cannot report plain success."""
     llm_error = "Error: Rate limit exceeded: too many requests"
-    details = _run_cycle(_step_llm(**{step: llm_error}))
+    cycles = _run_two_cycles(_step_llm(**{step: llm_error}))
 
-    assert details["steps"]["generation"]["hypotheses"]
-    assert details.get("errors"), f"{step} failure was not surfaced"
-    matching = [e for e in details["errors"] if marker in e]
-    assert matching, details["errors"]
+    assert all(d["steps"]["generation"]["hypotheses"] for d in cycles)
+    all_errors = [e for d in cycles for e in d.get("errors", [])]
+    matching = [e for e in all_errors if marker in e]
+    assert matching, f"{step} failure was not surfaced: {all_errors}"
     assert classify_llm_error(matching[0]) == "Rate limited by the model provider"
 
 

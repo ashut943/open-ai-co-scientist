@@ -242,7 +242,10 @@ def execute_cycle(
         # Status message: surface the real cause when generation failed, instead
         # of reporting success over an empty result (issue llnl#36).
         errors = cycle_details.get("errors", [])
-        produced_any = bool(cycle_details.get("steps", {}).get("generation", {}).get("hypotheses"))
+        steps_out = cycle_details.get("steps", {})
+        produced_any = bool(
+            steps_out.get("generation", {}).get("hypotheses") or steps_out.get("evolution", {}).get("hypotheses")
+        )
         if errors:
             categories = sorted({classify_llm_error(e) for e in errors})
             cause = "; ".join(categories)
@@ -517,11 +520,23 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
 
         elif step_name == "evolution":
             hypotheses = step_data.get("hypotheses", [])
-            html += f"<p><strong>Evolved {len(hypotheses)} new child hypotheses (refine/mutate/simplify/hybridize):</strong></p>"
+            if step_data.get("skipped_reason"):
+                html += f"<p>{html_lib.escape(step_data['skipped_reason'])}</p>"
+            else:
+                html += (
+                    f"<p><strong>Evolved {len(hypotheses)} child hypotheses from the previous cycle's "
+                    "meta-review (refine/mutate/simplify/hybridize):</strong></p>"
+                )
             for hypo in hypotheses:
+                parents = ", ".join(hypo.get("parent_ids") or [])
+                operator = hypo.get("evolution_operator") or ""
+                lineage = (
+                    f"<p><em>{html_lib.escape(operator)} of {html_lib.escape(parents)}</em></p>" if parents else ""
+                )
                 html += f"""
                 <div style="border-left: 3px solid #ffc107; padding-left: 10px; margin: 10px 0;">
                     <h5>{hypo.get("title", "Untitled")} (ID: {hypo.get("id", "Unknown")})</h5>
+                    {lineage}
                     <p>{hypo.get("text", "No description")}</p>
                 </div>
                 """

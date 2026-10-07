@@ -97,12 +97,11 @@ In accordance with LLNL policy on Generative Artificial Intelligence, this proje
 
 The system uses a multi-agent approach:
 
-1. **Generation Agent:** Creates new research hypotheses.
-2. **Reflection Agent:** Structured peer review (1-5 criterion scores, assumptions, falsification conditions, safety concerns, improvements).
-3. **Ranking Agent:** LLM pairwise judging against the research goal, then Elo updates to rank hypotheses.
-4. **Meta-Review Agent:** LLM analysis of recurring themes; runs before evolution and steers which operators/parents to use.
-5. **Evolution Agent:** LLM operators (refine / mutate / hybridize / simplify) create new child hypotheses linked by `parent_ids`.
-6. **Proximity Agent:** Analyzes similarity between hypotheses.
+1. **Generation step:** the **Evolution Agent** applies LLM operators (refine / mutate / hybridize / simplify) to the previous cycle's top hypotheses, guided by its meta-review, creating child hypotheses linked by `parent_ids`; the **Generation Agent** then adds fresh hypotheses. The first cycle has fresh hypotheses only.
+2. **Reflection Agent:** Structured peer review (1-5 criterion scores, assumptions, falsification conditions, safety concerns, improvements) of hypotheses not yet reviewed.
+3. **Ranking Agent:** One tournament per cycle: LLM pairwise judging against the research goal, then Elo updates to rank hypotheses.
+4. **Meta-Review Agent:** LLM analysis of recurring themes across reviews and matches; its strategy steers the next cycle's evolution.
+5. **Proximity Agent:** Analyzes similarity between hypotheses.
 
 ## 📚 Literature Integration
 

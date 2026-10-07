@@ -1245,23 +1245,38 @@ class SupervisorAgent:
     def run_cycle(self, research_goal: ResearchGoal, context: ContextMemory) -> Dict:
         """Run one coherent feedback cycle.
 
-        Order: Generation → Reflection → Tournament → Meta-review → Evolution →
-        Reflection → Tournament → Proximity. Meta-review runs before evolution so
-        its strategy can control which operators/parents are used.
+        Order: Generation (evolved children of the previous cycle's meta-review
+        + fresh ideas) → Reflection → Tournament → Meta-review → Proximity.
+        The meta-review at the end of a cycle steers the next cycle's evolution,
+        so the first cycle has no evolved children.
         """
         logger.info("--- Starting Cycle %d ---", context.iteration_number + 1)
         cycle_details = {"iteration": context.iteration_number + 1, "steps": {}, "meta_review": {}}
 
-        # 1. Generation
-        logger.info("Step 1: Generation")
+        # Every step's failures are collected here so the UI can show them;
+        # fallbacks keep the cycle running but must not look like success.
+        errors: List[str] = []
+
+        # 1. Generation. Evolution runs before fresh generation so its top
+        # candidates are ranked hypotheses, not unjudged new ones at default Elo.
+        logger.info("Step 1: Generation (evolution + new hypotheses)")
+        if context.meta_review_feedback:
+            evolved_hypotheses, evolution_errors = self.evolution_agent.evolve_hypotheses(context, research_goal)
+            errors += evolution_errors
+            for eh in evolved_hypotheses:
+                context.add_hypothesis(eh)
+            cycle_details["steps"]["evolution"] = {"hypotheses": [h.to_dict() for h in evolved_hypotheses]}
+        else:
+            cycle_details["steps"]["evolution"] = {
+                "hypotheses": [],
+                "skipped_reason": "First cycle: evolution starts next cycle, guided by this cycle's meta-review.",
+            }
+
         new_hypotheses, generation_errors = self.generation_agent.generate_new_hypotheses(research_goal, context)
+        errors += generation_errors
         for nh in new_hypotheses:
             context.add_hypothesis(nh)
         cycle_details["steps"]["generation"] = {"hypotheses": [h.to_dict() for h in new_hypotheses]}
-
-        # Every step's failures are collected here so the UI can show them;
-        # fallbacks keep the cycle running but must not look like success.
-        errors: List[str] = list(generation_errors)
 
         active_hypos = context.get_active_hypotheses()
 
@@ -1271,47 +1286,27 @@ class SupervisorAgent:
         errors += self.reflection_agent.review_hypotheses(unreviewed, context, research_goal)
         cycle_details["steps"]["reflection"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
 
-        # 3. Ranking (Tournament 1)
-        logger.info("Step 3: Ranking 1")
+        # 3. Ranking (single tournament over evolved + new + surviving hypotheses)
+        logger.info("Step 3: Ranking")
         errors += self.ranking_agent.run_tournament(active_hypos, context, research_goal)
-        cycle_details["steps"]["ranking1"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
+        cycle_details["steps"]["ranking"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
 
-        # 4. Meta-review (steers evolution)
+        final_ranked_hypos = [h for h in active_hypos]
+        context.active_hypotheses = {h.hypothesis_id: h for h in final_ranked_hypos}
+
+        # 4. Meta-review (steers the next cycle's evolution)
         logger.info("Step 4: Meta-Review")
         overview = self.meta_review_agent.summarize_and_feedback(context, adjacency=None, research_goal=research_goal)
         cycle_details["meta_review"] = overview
         cycle_details["steps"]["meta_review"] = overview
         if overview.get("fallback_reason"):
             errors.append(
-                "Meta-review failed; evolution was planned from a rule-based summary instead: "
+                "Meta-review failed; next cycle's evolution will use a rule-based summary instead: "
                 f"{overview['fallback_reason']}"
             )
 
-        # 5. Evolution (uses latest meta-review on context)
-        logger.info("Step 5: Evolution")
-        evolved_hypotheses, evolution_errors = self.evolution_agent.evolve_hypotheses(context, research_goal)
-        errors += evolution_errors
-        if evolved_hypotheses:
-            for eh in evolved_hypotheses:
-                context.add_hypothesis(eh)
-            logger.info("Step 5a: Reviewing Evolved Hypotheses")
-            errors += self.reflection_agent.review_hypotheses(evolved_hypotheses, context, research_goal)
-            active_hypos = context.get_active_hypotheses()
-            cycle_details["steps"]["evolution"] = {"hypotheses": [h.to_dict() for h in evolved_hypotheses]}
-            cycle_details["steps"]["reflection_evolved"] = {"hypotheses": [h.to_dict() for h in evolved_hypotheses]}
-        else:
-            cycle_details["steps"]["evolution"] = {"hypotheses": []}
-
-        # 6. Ranking (Tournament 2 - includes evolved)
-        logger.info("Step 6: Ranking 2")
-        errors += self.ranking_agent.run_tournament(active_hypos, context, research_goal)
-        cycle_details["steps"]["ranking2"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
-
-        final_ranked_hypos = [h for h in active_hypos]
-        context.active_hypotheses = {h.hypothesis_id: h for h in final_ranked_hypos}
-
-        # 7. Proximity Analysis
-        logger.info("Step 7: Proximity Analysis")
+        # 5. Proximity Analysis
+        logger.info("Step 5: Proximity Analysis")
         proximity_result = self.proximity_agent.build_proximity_graph(context)
         cycle_details["steps"]["proximity"] = {
             "adjacency_graph": proximity_result["adjacency_graph"],

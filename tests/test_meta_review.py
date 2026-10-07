@@ -129,7 +129,7 @@ def test_evolution_uses_meta_review_strategy():
     assert any("Latest meta-review guidance" in call.args[0] for call in mock_call.call_args_list)
 
 
-def test_run_cycle_orders_meta_review_before_evolution():
+def test_evolution_runs_in_next_cycle_generation_with_single_tournament():
     goal = ResearchGoal(description="Goal", num_hypotheses=2, top_k_hypotheses=2)
     context = ContextMemory()
     step_order: list[str] = []
@@ -181,17 +181,39 @@ def test_run_cycle_orders_meta_review_before_evolution():
             return _meta_payload()
         return json.dumps({"title": "X", "text": "Y", "reasoning": "z"})
 
-    with patch("app.agents.call_llm", side_effect=fake_llm):
-        details = SupervisorAgent().run_cycle(goal, context)
+    supervisor = SupervisorAgent()
+    with (
+        patch("app.agents.call_llm", side_effect=fake_llm),
+        patch(
+            "app.agents.ProximityAgent.build_proximity_graph",
+            return_value={"adjacency_graph": {}, "nodes": [], "edges": []},
+        ),
+    ):
+        first = supervisor.run_cycle(goal, context)
+        first_ids = {h["id"] for h in first["steps"]["generation"]["hypotheses"]}
+        assert "evolution_prompt" not in step_order
+        second = supervisor.run_cycle(goal, context)
 
-    keys = list(details["steps"].keys())
-    assert keys.index("meta_review") < keys.index("evolution")
-    assert keys.index("evolution") < keys.index("ranking2")
-    assert keys.index("ranking2") < keys.index("proximity")
-    assert "meta_prompt" in step_order
-    assert "evolution_prompt" in step_order
+    for details in (first, second):
+        assert list(details["steps"]) == [
+            "evolution",
+            "generation",
+            "reflection",
+            "ranking",
+            "meta_review",
+            "proximity",
+        ]
+    assert first["steps"]["evolution"]["hypotheses"] == []
+    assert first["steps"]["evolution"]["skipped_reason"]
+    assert first["meta_review"]["recurring_strengths"]
+
+    # Cycle 2 evolves cycle 1's ranked hypotheses, guided by cycle 1's meta-review.
     assert step_order.index("meta_prompt") < step_order.index("evolution_prompt")
-    assert details["meta_review"]["recurring_strengths"]
+    children = second["steps"]["evolution"]["hypotheses"]
+    assert children
+    assert all(set(c["parent_ids"]) <= first_ids for c in children)
+    ranked_ids = {h["id"] for h in second["steps"]["ranking"]["hypotheses"]}
+    assert {c["id"] for c in children} <= ranked_ids
 
 
 def test_run_cycle_skips_reflection_for_already_reviewed_hypotheses():
