@@ -22,7 +22,7 @@ A live demonstration can be accessed at: https://huggingface.co/spaces/liaoch/op
 ## 🚀 Features
 
 - **Multi-Agent System:** Iteratively generates, reviews, ranks, and evolves research hypotheses using specialized agents (Generation, Reflection, Ranking, Evolution, Proximity, Meta-Review).
-- **LLM Integration:** Uses OpenRouter API to access a variety of LLMs (model selection in UI).
+- **LLM Integration:** Uses an OpenAI-compatible API (Parley by default; OpenRouter optional) with model selection in the UI.
 - **Interactive Gradio UI:** Easy-to-use interface for research goal input, advanced settings, and results visualization.
 - **References & Literature:** Integrated arXiv search for related papers.
 - **Cost Control:** Automatically filters to cost-effective models in production deployment.
@@ -54,17 +54,19 @@ In accordance with LLNL policy on Generative Artificial Intelligence, this proje
     ```
 
 3. **Choose an LLM provider and set its API key:**
-    - OpenRouter (default):
-      ```bash
-      export LLM_PROVIDER=openrouter
-      export OPENROUTER_API_KEY=your_api_key
-      ```
-    - Or use OpenAI directly:
+    - OpenAI / Parley (default):
       ```bash
       export LLM_PROVIDER=openai
       export OPENAI_API_KEY=your_api_key
       ```
-      OpenAI API usage is billed separately from ChatGPT or Codex subscriptions.
+      Default `config.yaml` points `openai_base_url` at Parley
+      (`https://parley.api.mit.edu/v1`). For stock OpenAI, set it to
+      `https://api.openai.com/v1`. Usage is billed by that provider.
+    - Or use OpenRouter (e.g. free models / HF Spaces demo):
+      ```bash
+      export LLM_PROVIDER=openrouter
+      export OPENROUTER_API_KEY=your_api_key
+      ```
 
 4. **Run the Gradio app:**
     ```bash
@@ -97,7 +99,7 @@ The system uses a multi-agent approach:
 
 1. **Generation Agent:** Creates new research hypotheses.
 2. **Reflection Agent:** Reviews and assesses hypotheses for novelty and feasibility.
-3. **Ranking Agent:** Uses Elo rating system to rank hypotheses.
+3. **Ranking Agent:** LLM pairwise judging against the research goal, then Elo updates to rank hypotheses.
 4. **Evolution Agent:** Combines top hypotheses to create improved versions.
 5. **Proximity Agent:** Analyzes similarity between hypotheses.
 6. **Meta-Review Agent:** Provides overall critique and suggests next steps.
@@ -154,7 +156,7 @@ This system requires an OpenRouter API key to function. The public demo uses a l
 
 - Based on the idea of Google's AI Co-Scientist system.
 - Uses [Gradio](https://gradio.app/) for the user interface.
-- LLM access via [OpenRouter](https://openrouter.ai/).
+- LLM access via Parley / OpenAI-compatible APIs (OpenRouter still supported).
 
 ---
 

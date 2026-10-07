@@ -36,7 +36,7 @@ def call_llm_for_generation(
     response = call_llm(full_prompt, temperature=temperature, model=model)
     logger.info("LLM generation response: %s", response)
 
-    if response.startswith("Error:") or response.startswith("Authentication with OpenRouter failed"):
+    if response.startswith("Error:") or response.startswith("Authentication with"):
         logger.error(f"LLM generation call failed: {response}")
         return [{"title": "Error", "text": response}]
 
@@ -135,34 +135,215 @@ def call_llm_for_reflection(hypothesis_text: str, temperature: float = 0.5, mode
 # --- Ranking Helpers (Moved from main.py) ---
 
 
-def run_pairwise_debate(hypoA: Hypothesis, hypoB: Hypothesis) -> Hypothesis:
-    """Compares two hypotheses based on novelty and feasibility scores."""
+def _format_hypothesis_reviews(hypothesis: Hypothesis) -> str:
+    """Serialize prior reflection reviews for the tournament judge prompt."""
+    parts = []
+    if hypothesis.novelty_review:
+        parts.append(f"Novelty: {hypothesis.novelty_review}")
+    if hypothesis.feasibility_review:
+        parts.append(f"Feasibility: {hypothesis.feasibility_review}")
+    if hypothesis.review_comments:
+        parts.append(f"Comments: {'; '.join(hypothesis.review_comments)}")
+    return "\n".join(parts) if parts else "No prior reviews available."
+
+
+def _score_based_winner(hypoA: Hypothesis, hypoB: Hypothesis) -> Hypothesis:
+    """Fallback judge: sum novelty + feasibility ordinals (legacy LLNL behavior)."""
+    mapping = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, None: 0, "ERROR": 0}
 
     def score(h: Hypothesis) -> int:
-        mapping = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, None: 0, "ERROR": 0}  # Handle ERROR case
         score_novelty = mapping.get(h.novelty_review, 0) if isinstance(h.novelty_review, str) else 0
         score_feasibility = mapping.get(h.feasibility_review, 0) if isinstance(h.feasibility_review, str) else 0
         return score_novelty + score_feasibility
 
     scoreA = score(hypoA)
     scoreB = score(hypoB)
-
     if scoreA > scoreB:
-        winner = hypoA
-    elif scoreB > scoreA:
-        winner = hypoB
+        return hypoA
+    if scoreB > scoreA:
+        return hypoB
+    return random.choice([hypoA, hypoB])
+
+
+def _strip_json_fences(response: str) -> str:
+    response = response.strip()
+    if response.startswith("```json"):
+        response = response[7:]
+    if response.endswith("```"):
+        response = response[:-3]
+    return response.strip()
+
+
+def judge_pair(
+    research_goal: ResearchGoal,
+    hypothesis_a: Hypothesis,
+    hypothesis_b: Hypothesis,
+    reviews_a: str | None = None,
+    reviews_b: str | None = None,
+    temperature: float | None = None,
+) -> Dict:
+    """LLM tournament judge: compare two hypotheses against the real research goal.
+
+    Returns a dict with keys: winner ("A"|"B"|"TIE"), confidence, reasoning,
+    criterion_scores. On LLM/parse failure, winner is "ERROR" and reasoning
+    explains the failure (caller should fall back).
+    """
+    if reviews_a is None:
+        reviews_a = _format_hypothesis_reviews(hypothesis_a)
+    if reviews_b is None:
+        reviews_b = _format_hypothesis_reviews(hypothesis_b)
+    judge_temp = temperature if temperature is not None else research_goal.reflection_temperature
+
+    prompt = (
+        f"You are a scientific tournament judge comparing two research hypotheses.\n\n"
+        f"Research goal:\n{research_goal.description}\n\n"
+        f"Hypothesis A:\nTitle: {hypothesis_a.title}\n{hypothesis_a.text}\n\n"
+        f"Prior reviews for A:\n{reviews_a}\n\n"
+        f"Hypothesis B:\nTitle: {hypothesis_b.title}\n{hypothesis_b.text}\n\n"
+        f"Prior reviews for B:\n{reviews_b}\n\n"
+        f"Compare them on:\n"
+        f"- scientific soundness\n"
+        f"- novelty\n"
+        f"- relevance to the research goal\n"
+        f"- feasibility\n"
+        f"- testability / falsifiability\n"
+        f"- clarity\n"
+        f"- potential impact\n\n"
+        f"Return ONLY a JSON object with these keys:\n"
+        f'  "winner": "A" or "B" or "TIE",\n'
+        f'  "confidence": number between 0.0 and 1.0,\n'
+        f'  "reasoning": brief explanation of the decision,\n'
+        f'  "criterion_scores": object with per-criterion {{"A": score, "B": score}} '
+        f"where each score is 1-5.\n"
+    )
+
+    response = call_llm(prompt, temperature=judge_temp, model=research_goal.llm_model)
+    logger.info(
+        "Tournament judge response for %s vs %s: %s",
+        hypothesis_a.hypothesis_id,
+        hypothesis_b.hypothesis_id,
+        response,
+    )
+
+    if response.startswith("Error:") or response.startswith("Authentication with"):
+        logger.error("Tournament judge LLM call failed: %s", response)
+        return {
+            "winner": "ERROR",
+            "confidence": 0.0,
+            "reasoning": response,
+            "criterion_scores": {},
+        }
+
+    try:
+        parsed = json.loads(_strip_json_fences(response))
+        winner = str(parsed.get("winner", "")).upper().strip()
+        if winner not in {"A", "B", "TIE"}:
+            raise ValueError(f"Invalid winner value: {parsed.get('winner')!r}")
+        confidence = float(parsed.get("confidence", 0.5))
+        confidence = max(0.0, min(1.0, confidence))
+        reasoning = parsed.get("reasoning", "")
+        if not isinstance(reasoning, str):
+            reasoning = str(reasoning)
+        criterion_scores = parsed.get("criterion_scores", {})
+        if not isinstance(criterion_scores, dict):
+            criterion_scores = {}
+        return {
+            "winner": winner,
+            "confidence": confidence,
+            "reasoning": reasoning,
+            "criterion_scores": criterion_scores,
+        }
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
+        logger.warning("Could not parse tournament judge response: %s", response, exc_info=True)
+        return {
+            "winner": "ERROR",
+            "confidence": 0.0,
+            "reasoning": f"Could not parse LLM response: {e}",
+            "criterion_scores": {},
+        }
+
+
+def run_pairwise_debate(
+    hypoA: Hypothesis,
+    hypoB: Hypothesis,
+    research_goal: ResearchGoal | None = None,
+) -> Tuple[Hypothesis | None, Dict]:
+    """Judge a pair and return (winner_or_None_on_tie, judgment_dict).
+
+    Uses an LLM comparison against the real research goal when research_goal is
+    provided. Falls back to the legacy novelty+feasibility score sum on LLM
+    failure. Position of A/B is randomized to reduce presentation bias.
+    """
+    if research_goal is None:
+        winner = _score_based_winner(hypoA, hypoB)
+        judgment = {
+            "winner": "A" if winner is hypoA else "B",
+            "confidence": 1.0,
+            "reasoning": "Legacy score-based comparison (no research_goal provided).",
+            "criterion_scores": {},
+            "method": "score_fallback",
+        }
+        logger.info(
+            "Debate (score fallback): %s vs %s => Winner: %s",
+            hypoA.hypothesis_id,
+            hypoB.hypothesis_id,
+            winner.hypothesis_id,
+        )
+        return winner, judgment
+
+    # Randomize presentation order to mitigate position bias, then map back.
+    if random.random() < 0.5:
+        presented_a, presented_b = hypoA, hypoB
+        swap = False
     else:
-        winner = random.choice([hypoA, hypoB])  # Tie-breaker
+        presented_a, presented_b = hypoB, hypoA
+        swap = True
+
+    judgment = judge_pair(research_goal, presented_a, presented_b)
+    judgment["method"] = "llm"
+    raw_winner = judgment["winner"]
+
+    if raw_winner == "ERROR":
+        winner = _score_based_winner(hypoA, hypoB)
+        judgment["method"] = "score_fallback"
+        judgment["fallback_reason"] = judgment.get("reasoning", "LLM judge failed")
+        judgment["winner"] = "A" if winner is hypoA else "B"
+        logger.warning(
+            "Debate LLM failed; score fallback: %s vs %s => Winner: %s (%s)",
+            hypoA.hypothesis_id,
+            hypoB.hypothesis_id,
+            winner.hypothesis_id,
+            judgment["fallback_reason"][:120],
+        )
+        return winner, judgment
+
+    if raw_winner == "TIE":
+        judgment["winner"] = "TIE"
+        logger.info(
+            "Debate: %s vs %s => TIE (confidence=%.2f)",
+            hypoA.hypothesis_id,
+            hypoB.hypothesis_id,
+            judgment.get("confidence", 0.0),
+        )
+        return None, judgment
+
+    # Map presented A/B back to original hypoA/hypoB labels for the record.
+    if swap:
+        # presented_a was hypoB; LLM "A" means hypoB won.
+        actual = hypoB if raw_winner == "A" else hypoA
+        judgment["winner"] = "B" if actual is hypoB else "A"
+    else:
+        actual = hypoA if raw_winner == "A" else hypoB
+        judgment["winner"] = "A" if actual is hypoA else "B"
 
     logger.info(
-        "Debate: %s (score %d) vs %s (score %d) => Winner: %s",
+        "Debate: %s vs %s => Winner: %s (confidence=%.2f, method=llm)",
         hypoA.hypothesis_id,
-        scoreA,
         hypoB.hypothesis_id,
-        scoreB,
-        winner.hypothesis_id,
+        actual.hypothesis_id,
+        judgment.get("confidence", 0.0),
     )
-    return winner
+    return actual, judgment
 
 
 def update_elo(winner: Hypothesis, loser: Hypothesis, k_factor: int):
@@ -306,20 +487,35 @@ class RankingAgent:
 
         logger.info(f"Running tournament with {len(pairs)} pairs.")
         for hA, hB in pairs:
-            winner = run_pairwise_debate(hA, hB)
-            loser = hB if winner == hA else hA
-            # Pass the specific k_factor
-            update_elo(winner, loser, k_factor=k_factor)
-            # Record result in context (consider if this needs iteration info)
-            context.tournament_results.append(
-                {
-                    "iteration": context.iteration_number,  # Add iteration number
-                    "winner": winner.hypothesis_id,
-                    "loser": loser.hypothesis_id,
-                    "winner_score_after": winner.elo_score,
-                    "loser_score_after": loser.elo_score,
-                }
-            )
+            winner, judgment = run_pairwise_debate(hA, hB, research_goal=research_goal)
+            result_record = {
+                "iteration": context.iteration_number,
+                "hypothesis_a": hA.hypothesis_id,
+                "hypothesis_b": hB.hypothesis_id,
+                "judgment": {
+                    "winner": judgment.get("winner"),
+                    "confidence": judgment.get("confidence"),
+                    "reasoning": judgment.get("reasoning"),
+                    "criterion_scores": judgment.get("criterion_scores", {}),
+                    "method": judgment.get("method"),
+                },
+            }
+            if winner is None:
+                # True tie: leave Elo unchanged; still record the match.
+                result_record["winner"] = None
+                result_record["loser"] = None
+                result_record["tie"] = True
+                result_record["winner_score_after"] = hA.elo_score
+                result_record["loser_score_after"] = hB.elo_score
+            else:
+                loser = hB if winner is hA else hA
+                update_elo(winner, loser, k_factor=k_factor)
+                result_record["winner"] = winner.hypothesis_id
+                result_record["loser"] = loser.hypothesis_id
+                result_record["tie"] = False
+                result_record["winner_score_after"] = winner.elo_score
+                result_record["loser_score_after"] = loser.elo_score
+            context.tournament_results.append(result_record)
 
 
 class EvolutionAgent:

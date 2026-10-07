@@ -59,9 +59,12 @@ class ResearchGoal:
         self.description = description
         self.constraints = constraints if constraints else {}
         # Store runtime settings, falling back to config defaults if not provided
-        self.llm_model = (
-            llm_model if llm_model else config.get("llm_model", "google/gemini-flash-1.5")
-        )  # Example default
+        if llm_model:
+            self.llm_model = llm_model
+        elif str(config.get("llm_provider", "openai")).strip().lower() == "openai":
+            self.llm_model = config.get("openai_model", "gpt-5-mini")
+        else:
+            self.llm_model = config.get("llm_model", "gpt-5-mini")
         self.num_hypotheses = num_hypotheses if num_hypotheses is not None else config.get("num_hypotheses", 3)
         self.generation_temperature = (
             generation_temperature

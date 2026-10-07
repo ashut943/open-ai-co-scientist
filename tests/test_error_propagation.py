@@ -17,8 +17,8 @@ from app.utils import classify_llm_error
 @pytest.mark.parametrize(
     "error_text, expected",
     [
-        ("Error: OpenRouter API key not set.", "Missing or invalid API key"),
-        ("Authentication with OpenRouter failed (401 Unauthorized).", "Missing or invalid API key"),
+        ("Error: OpenAI API key not set.", "Missing or invalid API key"),
+        ("Authentication with OpenAI failed (401 Unauthorized).", "Missing or invalid API key"),
         ("Error: Rate limit exceeded: slow down", "Rate limited by the model provider"),
         ("Error: Model provider timed out ('x'). Details: request timeout", "Model provider timed out"),
         ("Error: Model unavailable or delisted ('x/y'). No endpoints found", "Model unavailable or delisted"),
@@ -41,7 +41,7 @@ def _goal():
 def test_generate_returns_errors_and_keeps_them_out_of_hypotheses():
     with patch(
         "app.agents.call_llm",
-        return_value="Authentication with OpenRouter failed (401 Unauthorized).",
+        return_value="Authentication with OpenAI failed (401 Unauthorized).",
     ):
         hypos, errors = GenerationAgent().generate_new_hypotheses(_goal(), ContextMemory())
 
@@ -74,7 +74,7 @@ def test_generate_uses_selected_research_goal_model():
 @pytest.mark.parametrize(
     "llm_error, expected_category",
     [
-        ("Authentication with OpenRouter failed (401 Unauthorized).", "Missing or invalid API key"),
+        ("Authentication with OpenAI failed (401 Unauthorized).", "Missing or invalid API key"),
         ("Error: Rate limit exceeded: too many requests", "Rate limited by the model provider"),
         ("Error: Model unavailable or delisted ('x'). No endpoints found", "Model unavailable or delisted"),
     ],
@@ -101,13 +101,10 @@ def test_surfaced_error_never_contains_key(monkeypatch):
     """End-to-end: a provider error echoing the key must be redacted before it
     reaches cycle_details["errors"]. Exercises the real call_llm redaction (the
     'No endpoints found' branch returns immediately — no retry sleeps)."""
-    fake_key = "sk-or-v1-LEAK-CANARY"
-    monkeypatch.setenv("OPENROUTER_API_KEY", fake_key)
-    # Mock the fallback fetch so the model-unavailable path stays offline (llnl#26).
-    with (
-        patch.object(utils, "fetch_free_models", return_value=["fb-a:free", "fb-b:free"]),
-        patch.object(utils, "OpenAI") as mock_openai,
-    ):
+    fake_key = "sk-parley-LEAK-CANARY"
+    monkeypatch.setenv("OPENAI_API_KEY", fake_key)
+    monkeypatch.setitem(utils.config, "max_retries", 1)
+    with patch.object(utils, "OpenAI") as mock_openai:
         mock_openai.return_value.chat.completions.create.side_effect = Exception(
             f"No endpoints found for model; key was {fake_key}"
         )

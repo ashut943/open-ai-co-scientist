@@ -1,7 +1,7 @@
 """Offline tests: imports, environment detection, and Gradio UI construction.
 
-The OpenRouter model-list fetch inside create_gradio_interface() is mocked so
-these tests are deterministic and make no network calls.
+Network fetches inside create_gradio_interface() are mocked so these tests are
+deterministic and make no network calls. Default provider is OpenAI/Parley.
 """
 
 import importlib.util
@@ -102,24 +102,44 @@ def test_default_model_is_selected_and_first_choice(gradio_app_module):
     assert choices.count(gradio_app_module.CONFIGURED_LLM_MODEL) == 1
 
 
-def test_free_model_is_default_when_configured_model_is_not_free(gradio_app_module, monkeypatch):
-    monkeypatch.setattr(gradio_app_module, "CONFIGURED_LLM_MODEL", "paid/model")
+def test_openai_default_keeps_configured_model_first(gradio_app_module, monkeypatch):
+    monkeypatch.setattr(gradio_app_module, "LLM_PROVIDER", "openai")
+    monkeypatch.setattr(gradio_app_module, "CONFIGURED_LLM_MODEL", "gpt-5-mini")
 
-    choices = gradio_app_module.get_model_dropdown_choices(["paid/model", "free/model:free"])
+    choices = gradio_app_module.get_model_dropdown_choices(["gpt-5-mini", "claude-sonnet-5"])
 
-    assert choices[0] == "free/model:free"
-
-
-def test_stale_configured_free_model_is_not_forced_as_default(gradio_app_module, monkeypatch):
-    monkeypatch.setattr(gradio_app_module, "CONFIGURED_LLM_MODEL", "delisted/model:free")
-
-    choices = gradio_app_module.get_model_dropdown_choices(["vendor/model-70b:free", "vendor/model-3b:free"])
-
-    assert choices[0] == "vendor/model-3b:free"
-    assert "delisted/model:free" not in choices
+    assert choices[0] == "gpt-5-mini"
 
 
-def test_hf_spaces_model_list_uses_dynamic_free_model_cache(gradio_app_module, monkeypatch):
+def test_openai_default_ignores_openrouter_free_suffix_heuristics(gradio_app_module, monkeypatch):
+    monkeypatch.setattr(gradio_app_module, "LLM_PROVIDER", "openai")
+    monkeypatch.setattr(gradio_app_module, "CONFIGURED_LLM_MODEL", "gpt-5-mini")
+
+    choices = gradio_app_module.get_model_dropdown_choices(
+        ["vendor/model-70b:free", "vendor/model-3b:free", "gpt-5-mini"]
+    )
+
+    assert choices[0] == "gpt-5-mini"
+
+
+def test_openai_model_list_uses_configured_model_without_network(gradio_app_module, monkeypatch):
+    monkeypatch.setattr(gradio_app_module, "LLM_PROVIDER", "openai")
+    monkeypatch.setattr(gradio_app_module, "CONFIGURED_LLM_MODEL", "gpt-5-mini")
+
+    with (
+        patch.object(gradio_app_module, "fetch_free_models") as mock_fetch,
+        patch.object(gradio_app_module.requests, "get") as mock_get,
+    ):
+        models = gradio_app_module.fetch_available_models()
+
+    assert models == ["gpt-5-mini"]
+    mock_fetch.assert_not_called()
+    mock_get.assert_not_called()
+
+
+def test_openrouter_hf_spaces_model_list_uses_dynamic_free_model_cache(gradio_app_module, monkeypatch):
+    """OpenRouter path still used when explicitly selected (e.g. HF Spaces)."""
+    monkeypatch.setattr(gradio_app_module, "LLM_PROVIDER", "openrouter")
     monkeypatch.setenv("SPACE_ID", "owner/space")
     with (
         patch.object(gradio_app_module, "fetch_free_models", return_value=["vendor/model-3b:free"]) as mock_fetch,
@@ -129,17 +149,6 @@ def test_hf_spaces_model_list_uses_dynamic_free_model_cache(gradio_app_module, m
 
     assert models == ["vendor/model-3b:free"]
     mock_fetch.assert_called_once()
-    mock_get.assert_not_called()
-
-
-def test_openai_model_list_uses_configured_model_without_openrouter_request(gradio_app_module, monkeypatch):
-    monkeypatch.setattr(gradio_app_module, "LLM_PROVIDER", "openai")
-    monkeypatch.setattr(gradio_app_module, "CONFIGURED_LLM_MODEL", "gpt-4o-mini")
-
-    with patch.object(gradio_app_module.requests, "get") as mock_get:
-        models = gradio_app_module.fetch_available_models()
-
-    assert models == ["gpt-4o-mini"]
     mock_get.assert_not_called()
 
 

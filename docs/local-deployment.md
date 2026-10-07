@@ -14,9 +14,9 @@ cd ~/workspace/open-ai-co-scientist-local-deploy
 ```
 
 Provide the selected provider and its API key through the environment
-(`LLM_PROVIDER=openrouter` with `OPENROUTER_API_KEY`, or
-`LLM_PROVIDER=openai` with `OPENAI_API_KEY`). For local-only testing, a symlink
-to an existing gitignored `.env` is fine:
+(`LLM_PROVIDER=openai` with `OPENAI_API_KEY` for Parley/OpenAI — the default —
+or `LLM_PROVIDER=openrouter` with `OPENROUTER_API_KEY`). For local-only testing,
+a symlink to an existing gitignored `.env` is fine:
 
 ```bash
 ln -s ~/workspace/open-ai-co-scientist/.env .env

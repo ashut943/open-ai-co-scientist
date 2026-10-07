@@ -44,15 +44,15 @@ def redact_secrets(text: str) -> str:
 
 
 def get_llm_provider() -> str:
-    """Return the configured LLM provider, defaulting to OpenRouter."""
-    return os.getenv("LLM_PROVIDER", str(config.get("llm_provider", "openrouter"))).strip().lower()
+    """Return the configured LLM provider, defaulting to OpenAI/Parley."""
+    return os.getenv("LLM_PROVIDER", str(config.get("llm_provider", "openai"))).strip().lower()
 
 
 def get_configured_model(provider: Optional[str] = None) -> str:
     """Return the default model for the selected provider."""
     provider = provider or get_llm_provider()
     if provider == "openai":
-        return str(config.get("openai_model", "gpt-4o-mini"))
+        return str(config.get("openai_model", "gpt-5-mini"))
     return str(config.get("llm_model", ""))
 
 
@@ -65,7 +65,12 @@ def classify_llm_error(error_text: str) -> str:
     """
     text = (error_text or "").lower()
     # Order matters: most specific first.
-    if "api key not set" in text or "401" in text or "authentication with openrouter failed" in text:
+    if (
+        "api key not set" in text
+        or "401" in text
+        or "authentication with openrouter failed" in text
+        or "authentication with openai failed" in text
+    ):
         return "Missing or invalid API key"
     if "timed out" in text or "timeout" in text:
         return "Model provider timed out"

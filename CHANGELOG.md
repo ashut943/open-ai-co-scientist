@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Default LLM provider is now OpenAI-compatible / Parley (`llm_provider:
+  openai`, `openai_base_url: https://parley.api.mit.edu/v1`). OpenRouter
+  remains available via `LLM_PROVIDER=openrouter`. Offline tests target the
+  OpenAI/Parley path.
+- Tournament match winners are now chosen by an LLM judge that compares
+  hypotheses against the real research goal (soundness, novelty, relevance,
+  feasibility, testability, clarity, impact) instead of summing novelty +
+  feasibility ordinals. Existing Elo update math is unchanged; ties leave
+  ratings alone; LLM/parse failures fall back to the legacy score comparison.
+
 - Fixed the Hugging Face Space build failure by pinning `pydantic` to the
   range required by `gradio[oauth,mcp]==6.19.0`, pinning the Space runtime to
   Python 3.12, and adding a deploy preflight that runs Hugging Face's Gradio

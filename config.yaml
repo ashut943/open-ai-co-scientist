@@ -1,20 +1,23 @@
 # Configuration file for proposal-gen-v1.py
 
-# Provider can also be overridden with LLM_PROVIDER=openrouter or openai.
-llm_provider: "openrouter"
+# Provider can also be overridden with LLM_PROVIDER=openai or openrouter.
+# Default is OpenAI-compatible (Parley). OpenRouter remains supported for the
+# public HF demo when LLM_PROVIDER=openrouter.
+llm_provider: "openai"
 
-# OpenRouter API Base URL
+# OpenRouter API Base URL (used only when llm_provider is openrouter)
 openrouter_base_url: "https://openrouter.ai/api/v1"
 
-# LLM Model. Use a compact free default so the public Hugging Face demo can
-# finish a full multi-call cycle within its UI timeout. If this one is delisted,
-# rate-limited, or too slow, call_llm auto-falls back to other live free models.
+# OpenRouter model (HF demo / openrouter provider). Compact free default so the
+# public demo can finish a multi-call cycle; call_llm falls back to other live
+# free models if this one is delisted or rate-limited.
 llm_model: "meta-llama/llama-3.2-3b-instruct:free"
 
-# Direct OpenAI settings, used when LLM_PROVIDER=openai.
-# openai_base_url: "https://api.openai.com/v1"
+# OpenAI-compatible settings (default provider). Parley is the MIT gateway;
+# point openai_base_url at https://api.openai.com/v1 for stock OpenAI.
 openai_base_url: "https://parley.api.mit.edu/v1"
-openai_model: "gpt-4o-mini"
+# Must be a model Parley actually serves (gpt-4o-mini is not on that list).
+openai_model: "gpt-5-mini"
 
 # Number of hypotheses to generate
 num_hypotheses: 4

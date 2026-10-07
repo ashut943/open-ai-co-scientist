@@ -1,8 +1,8 @@
-"""Model fallback: a delisted primary model must not fail every run (issue llnl#26).
+"""Model fallback under the default OpenAI/Parley provider.
 
-Fallback candidates come from OpenRouter's live/cached free-model list, not a
-hardcoded preferred model list. Offline — the client and the model fetch are
-mocked.
+OpenAI path: only explicit fallback_models are tried (no live OpenRouter free
+list). OpenRouter free-model discovery helpers remain covered for the optional
+openrouter provider. Offline — the client and fetches are mocked.
 """
 
 import json
@@ -176,161 +176,146 @@ def test_get_fallback_models_excludes_primary_from_dynamic_list(monkeypatch):
 
 
 def test_falls_back_to_working_model(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
 
     def behavior(model):
-        if model == "good/model:free":
+        if model == "gpt-5-mini":
             return _ok_completion("RECOVERED CONTENT")
         raise Exception("No endpoints found for model")
 
     with patch.object(utils, "OpenAI", return_value=_client_that(behavior)):
-        result = call_llm("prompt", model="dead/model:free", fallback_models=["good/model:free"])
+        result = call_llm("prompt", model="dead-model", fallback_models=["gpt-5-mini"])
     assert result == "RECOVERED CONTENT"
 
 
 def test_no_fallback_on_auth_error(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
     client = _client_that(_raise("Error code: 401 - No auth credentials found"))
     with patch.object(utils, "OpenAI", return_value=client):
-        result = call_llm("prompt", model="primary:free", fallback_models=["fallback:free"])
-    assert "401" in result or "Authentication with OpenRouter failed" in result
+        result = call_llm("prompt", model="primary", fallback_models=["fallback"])
+    assert "401" in result or "Authentication with OpenAI failed" in result
     assert client.chat.completions.create.call_count == 1  # never tries other models
 
 
 def test_primary_success_skips_fallback(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
     client = _client_that(lambda model: _ok_completion("PRIMARY OK"))
     with patch.object(utils, "OpenAI", return_value=client):
-        result = call_llm("prompt", model="primary:free", fallback_models=["fallback:free"])
+        result = call_llm("prompt", model="primary", fallback_models=["fallback"])
     assert result == "PRIMARY OK"
-    assert client.chat.completions.create.call_count == 1  # no fallback fetch/attempt
+    assert client.chat.completions.create.call_count == 1  # no fallback attempt
 
 
-# --- dynamic fallback: live list is the source of truth ---
+# --- OpenAI path: no automatic live free-model list ---
 
 
-def test_dynamic_fallback_uses_live_free_models(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
-
-    def behavior(model):
-        if model == "live-b:free":
-            return _ok_completion("FROM LIVE LIST")
-        raise Exception("No endpoints found for model")  # primary + live-a dead
-
-    with (
-        patch.object(utils, "fetch_free_models", return_value=["live-a:free", "live-b:free"]),
-        patch.object(utils, "OpenAI", return_value=_client_that(behavior)),
-    ):
-        result = call_llm("prompt", model="dead-primary:free")  # no explicit fallback_models
-    assert result == "FROM LIVE LIST"
-
-
-def test_no_hardcoded_fallback_when_live_list_unavailable(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+def test_openai_does_not_auto_fallback_to_live_free_models(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
     client = _client_that(_raise("No endpoints found for model"))
 
     with (
-        patch.object(utils, "fetch_free_models", return_value=[]),  # live fetch failed
+        patch.object(utils, "fetch_free_models", return_value=["live-a:free", "live-b:free"]) as mock_fetch,
         patch.object(utils, "OpenAI", return_value=client),
     ):
-        result = call_llm("prompt", model="dead-primary:free")
+        result = call_llm("prompt", model="dead-primary")  # no explicit fallback_models
+    assert classify_llm_error(result) == "Model unavailable or delisted"
+    assert client.chat.completions.create.call_count == 1
+    mock_fetch.assert_not_called()
+
+
+def test_no_hardcoded_fallback_without_explicit_list(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
+    client = _client_that(_raise("No endpoints found for model"))
+
+    with patch.object(utils, "OpenAI", return_value=client):
+        result = call_llm("prompt", model="dead-primary")
     assert classify_llm_error(result) == "Model unavailable or delisted"
     assert client.chat.completions.create.call_count == 1
 
 
 def test_all_unavailable_surfaces_clear_error(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
     client = _client_that(_raise("No endpoints found"))
-    with (
-        patch.object(utils, "fetch_free_models", return_value=["b:free", "c:free"]),
-        patch.object(utils, "OpenAI", return_value=client),
-    ):
-        result = call_llm("prompt", model="a:free")
+    with patch.object(utils, "OpenAI", return_value=client):
+        result = call_llm("prompt", model="a", fallback_models=["b", "c"])
     assert classify_llm_error(result) == "Model unavailable or delisted"
-    assert client.chat.completions.create.call_count == 3  # primary + 2 live fallbacks
+    assert client.chat.completions.create.call_count == 3  # primary + 2 explicit fallbacks
 
 
 def test_fallback_attempts_are_bounded(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
     client = _client_that(_raise("No endpoints found"))
-    many = [f"m{i}:free" for i in range(20)]
-    with (
-        patch.object(utils, "fetch_free_models", return_value=many),
-        patch.object(utils, "OpenAI", return_value=client),
-    ):
-        call_llm("prompt", model="a:free")
+    many = [f"m{i}" for i in range(20)]
+    with patch.object(utils, "OpenAI", return_value=client):
+        call_llm("prompt", model="a", fallback_models=many)
     # primary + at most MAX_FALLBACK_ATTEMPTS, never all 20.
     assert client.chat.completions.create.call_count == 1 + utils.MAX_FALLBACK_ATTEMPTS
 
 
 def test_missing_key_still_short_circuits(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    result = call_llm("prompt", model="x:free", fallback_models=["y:free"])
+    with patch.object(utils, "OpenAI") as mock_openai:
+        result = call_llm("prompt", model="x", fallback_models=["y"])
     assert result.startswith("Error:") and "key" in result.lower()
+    mock_openai.assert_not_called()
 
 
-# --- rate-limited free models: move to the next model, don't hang (found via
-#     live testing — a free model returning 429 must not block the whole run) ---
+# --- rate-limited / timed-out models: move to the next explicit fallback ---
 
 
 def test_rate_limited_primary_falls_back(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
 
     def behavior(model):
-        if model == "good:free":
+        if model == "good":
             return _ok_completion("OK AFTER RATE LIMIT")
         raise Exception("Error code: 429 - temporarily rate-limited upstream")
 
     with patch.object(utils, "OpenAI", return_value=_client_that(behavior)):
-        result = call_llm("prompt", model="busy:free", fallback_models=["good:free"])
+        result = call_llm("prompt", model="busy", fallback_models=["good"])
     assert result == "OK AFTER RATE LIMIT"
 
 
 def test_all_rate_limited_surfaces_clear_error(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
     client = _client_that(_raise("Error code: 429 - rate-limited"))
-    with (
-        patch.object(utils, "fetch_free_models", return_value=["b:free"]),
-        patch.object(utils, "OpenAI", return_value=client),
-    ):
-        result = call_llm("prompt", model="a:free")
+    with patch.object(utils, "OpenAI", return_value=client):
+        result = call_llm("prompt", model="a", fallback_models=["b"])
     assert classify_llm_error(result) == "Rate limited by the model provider"
     assert client.chat.completions.create.call_count == 2  # primary + 1 fallback, no long retry
 
 
 def test_timed_out_primary_falls_back(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
 
     def behavior(model):
-        if model == "good:free":
+        if model == "good":
             return _ok_completion("OK AFTER TIMEOUT")
         raise Exception("Request timed out while waiting for provider")
 
     with patch.object(utils, "OpenAI", return_value=_client_that(behavior)):
-        result = call_llm("prompt", model="slow:free", fallback_models=["good:free"])
+        result = call_llm("prompt", model="slow", fallback_models=["good"])
     assert result == "OK AFTER TIMEOUT"
 
 
 def test_all_timed_out_surfaces_clear_error(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
     client = _client_that(_raise("Request timeout from provider"))
-    with (
-        patch.object(utils, "fetch_free_models", return_value=["b:free"]),
-        patch.object(utils, "OpenAI", return_value=client),
-    ):
-        result = call_llm("prompt", model="a:free")
+    with patch.object(utils, "OpenAI", return_value=client):
+        result = call_llm("prompt", model="a", fallback_models=["b"])
     assert classify_llm_error(result) == "Model provider timed out"
     assert client.chat.completions.create.call_count == 2
 
 
 def test_generic_provider_error_also_falls_back(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
 
     def behavior(model):
-        if model == "good:free":
+        if model == "good":
             return _ok_completion("RECOVERED")
         raise Exception("Error code: 502 - Provider returned error")
 
     with patch.object(utils, "OpenAI", return_value=_client_that(behavior)):
-        result = call_llm("prompt", model="broken:free", fallback_models=["good:free"])
+        result = call_llm("prompt", model="broken", fallback_models=["good"])
     assert result == "RECOVERED"
