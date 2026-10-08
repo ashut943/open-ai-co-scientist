@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   review prompt.
 
 ### Fixed
+- LLM calls send an output cap (`llm_max_output_tokens`, default 32000) as
+  `max_completion_tokens`. Without it the gateway's default (~4k for Claude
+  models) cut off Opus generations mid-JSON. Output stopped at the limit is now
+  reported as "cut off at the output token limit" instead of a JSON parse error.
+- Token counting reads Anthropic-style `input_tokens`/`output_tokens` and adds
+  `prompt_tokens_details.cached_tokens` when the gateway under-reports
+  `prompt_tokens` (Parley + Opus showed 4 input tokens per call).
 - The "Related papers for the research goal" search no longer sends the whole
   goal text (OpenAlex answered 400 Bad Request). It searches the key phrases of
   the top-ranked hypotheses, or the goal's first sentence when there are none.

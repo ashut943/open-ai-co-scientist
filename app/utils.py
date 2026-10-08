@@ -319,17 +319,79 @@ def usage_step(name: str):
         _usage_step.reset(token)
 
 
+def _usage_get(usage, name: str):
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return usage.get(name)
+    return getattr(usage, name, None)
+
+
+def _usage_int(usage, *names: str) -> int:
+    """Read a count from a usage object or dict; try each field name in order."""
+    for name in names:
+        value = _usage_get(usage, name)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _extract_token_counts(usage) -> tuple[int, int, int]:
+    """Normalize OpenAI / Anthropic / gateway usage shapes into (input, output, reasoning).
+
+    Some Claude→OpenAI translators put almost all prompt tokens in
+    ``prompt_tokens_details.cached_tokens`` and leave ``prompt_tokens`` near zero
+    (we saw exactly 4 per call from Parley + Opus). Take the largest consistent
+    reconstruction so billing estimates are not wildly low.
+    """
+    prompt = _usage_int(usage, "prompt_tokens")
+    input_named = _usage_int(usage, "input_tokens")
+    completion = _usage_int(usage, "completion_tokens")
+    output_named = _usage_int(usage, "output_tokens")
+    total = _usage_int(usage, "total_tokens")
+
+    prompt_details = _usage_get(usage, "prompt_tokens_details")
+    cached = _usage_int(prompt_details, "cached_tokens")
+    cache_read = _usage_int(usage, "cache_read_input_tokens")
+    cache_create = _usage_int(usage, "cache_creation_input_tokens")
+
+    output_tokens = max(completion, output_named)
+    input_candidates = [
+        prompt,
+        input_named,
+        prompt + cached,
+        input_named + cache_read + cache_create,
+    ]
+    if total > output_tokens:
+        input_candidates.append(total - output_tokens)
+    input_tokens = max(input_candidates)
+
+    completion_details = _usage_get(usage, "completion_tokens_details")
+    reasoning = max(
+        _usage_int(completion_details, "reasoning_tokens"),
+        _usage_int(usage, "reasoning_tokens", "thinking_tokens"),
+    )
+    return input_tokens, output_tokens, reasoning
+
+
 def _record_usage(completion) -> None:
     meter, usage = _usage_meter.get(), getattr(completion, "usage", None)
     if meter is None or usage is None:
         return
-    details = getattr(usage, "completion_tokens_details", None)
-    meter.add(
-        _usage_step.get(),
-        int(getattr(usage, "prompt_tokens", 0) or 0),
-        int(getattr(usage, "completion_tokens", 0) or 0),
-        int(getattr(details, "reasoning_tokens", 0) or 0),
-    )
+    input_tokens, output_tokens, reasoning = _extract_token_counts(usage)
+    if input_tokens < 50 and output_tokens > 500:
+        # One-line diagnostic when the gateway under-reports input (seen with Opus).
+        logger.warning(
+            "Suspicious token usage (input=%s output=%s); raw usage=%s",
+            input_tokens,
+            output_tokens,
+            usage,
+        )
+    meter.add(_usage_step.get(), input_tokens, output_tokens, reasoning)
 
 
 def estimate_cost(usage_total: Dict, model: Optional[str]) -> Optional[float]:
@@ -362,13 +424,23 @@ def _attempt_model(
         try:
             # temperature is not sent: reasoning models (gpt-5*, o-series) reject any
             # value but the default, so every model runs at its provider default.
-            completion = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            request = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+            max_output_tokens = int(config.get("llm_max_output_tokens") or 0)
+            if max_output_tokens > 0:
+                request["max_completion_tokens"] = max_output_tokens
+            completion = client.chat.completions.create(**request)
             _record_usage(completion)
             if completion.choices and len(completion.choices) > 0:
-                return completion.choices[0].message.content or ""
+                choice = completion.choices[0]
+                if getattr(choice, "finish_reason", None) == "length":
+                    # Retrying would hit the same limit, so fail fast with the actual cause.
+                    logger.error("Output from '%s' was cut off at the token limit", model)
+                    return (
+                        f"Error: The output from '{model}' was cut off at the output token limit "
+                        f"(llm_max_output_tokens: {max_output_tokens or 'provider default'}). "
+                        "Raise llm_max_output_tokens in config.yaml."
+                    )
+                return choice.message.content or ""
             else:
                 logger.error("No choices in the LLM response: %s", completion)
                 last_error_message = f"No choices in the response: {completion}"

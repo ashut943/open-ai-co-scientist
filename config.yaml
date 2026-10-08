@@ -17,14 +17,20 @@ llm_model: "meta-llama/llama-3.2-3b-instruct:free"
 # point openai_base_url at https://api.openai.com/v1 for stock OpenAI.
 openai_base_url: "https://parley.api.mit.edu/v1"
 # Must be a model Parley actually serves (gpt-4o-mini is not on that list).
-openai_model: "gemini-3.8-flash" #"gpt-5-mini"
+openai_model: "claude-opus-5-5" #"gemini-3.8-flash" #"gpt-5-mini"
 
 # Number of hypotheses to generate
 num_hypotheses: 4
 
 # Per-request timeout. Reasoning models (gemini-3.8-flash, gpt-5*) can think for
 # over a minute before answering a generation prompt, so 30s was too short.
-llm_request_timeout_seconds: 180
+llm_request_timeout_seconds: 360
+
+# Output cap per LLM call, including reasoning tokens (sent as
+# max_completion_tokens). Without it, gateways apply their own default, which
+# for Claude models can be ~4k and cuts off a generation of 4 hypotheses
+# mid-JSON. 0 sends no cap.
+llm_max_output_tokens: 32000
 
 # Max LLM calls in flight at once for reflection reviews and tournament judging
 # (they are independent). Lower it if the provider returns rate-limit errors;
@@ -35,6 +41,7 @@ llm_max_concurrency: 4
 # each cycle (list prices; models not listed show token counts only).
 token_prices_per_million:
   gemini-3.8-flash: [0.75, 3.75]
+  claude-opus-5-5: [4.0, 20.0]
 
 # Elo K-factor
 elo_k_factor: 32

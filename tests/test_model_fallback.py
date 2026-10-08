@@ -38,7 +38,7 @@ def _client_that(behavior):
     """Mocked OpenAI client whose create() dispatches on the model kwarg."""
     client = MagicMock()
 
-    def create(model=None, messages=None, temperature=None):
+    def create(model=None, messages=None, **kwargs):
         return behavior(model)
 
     client.chat.completions.create.side_effect = create

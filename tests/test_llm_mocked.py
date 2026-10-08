@@ -164,3 +164,29 @@ def test_reflection_passes_selected_model_to_llm_boundary():
     assert review["novelty_review"] == "HIGH"
     assert review["critical_assumptions"] == ["Stable supply"]
     assert mock_call.call_args.kwargs["model"] == "gpt-5-mini"
+
+
+def test_call_llm_sends_configured_output_token_cap(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-test")
+    monkeypatch.setitem(utils.config, "llm_max_output_tokens", 32000)
+    with patch.object(utils, "OpenAI") as mock_openai:
+        create = mock_openai.return_value.chat.completions.create
+        create.return_value = _completion("ok")
+        assert utils.call_llm("prompt") == "ok"
+
+    assert create.call_args.kwargs["max_completion_tokens"] == 32000
+
+
+def test_truncated_output_reports_token_limit_without_retrying(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-test")
+    monkeypatch.setitem(utils.config, "llm_max_output_tokens", 4096)
+    truncated = _completion('[{"title": "T", "text": "cut off mid')
+    truncated.choices[0].finish_reason = "length"
+    with patch.object(utils, "OpenAI") as mock_openai:
+        create = mock_openai.return_value.chat.completions.create
+        create.return_value = truncated
+        result = call_llm_for_generation("test goal")
+
+    assert create.call_count == 1
+    assert "cut off at the output token limit" in result[0]["text"]
+    assert "llm_max_output_tokens" in result[0]["text"]

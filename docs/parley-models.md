@@ -12,7 +12,7 @@ Scores are **resolution rate %** at the reported high-effort agent setting. Diff
 
 In this repo, a **cycle** is one click of **Run Cycle** in the Gradio UI: one full Open AI Co-Scientist pipeline pass for your research goal.
 
-![One Open AI Co-Scientist cycle schematic](parley-cycle-schematic.png?v=2026-10-07c)
+![One Open AI Co-Scientist cycle schematic](parley-cycle-schematic.png?v=2026-10-08c)
 
 Each cycle runs these steps in order:
 
@@ -50,13 +50,53 @@ Tournament judging is the biggest single cost: 45% of input tokens in cycle 2 an
 
 **Hidden reasoning tokens are the biggest uncertainty.** All models in the plot are reasoning models. Their internal reasoning is billed as output even though the app never sees it ([OpenAI reasoning guide](https://platform.openai.com/docs/guides/reasoning), [Anthropic extended thinking](https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking), [Gemini thinking](https://ai.google.dev/gemini-api/docs/thinking)). `call_llm` sets no `max_tokens` or reasoning-effort limit, so the provider default applies. The plot assumes **~1,000 reasoning tokens per call**. That is an assumption for short, structured tasks at default effort, not a published figure. At 30 calls per cycle it adds ~30k output tokens.
 
-**Planning figure: ~49k input + ~40k output per cycle** (10k visible + 30k reasoning), averaged over a 3-cycle session. Before literature grounding it was ~41k + ~39k. The original figure of 80k + 32k assumed roughly 6 calls per cycle and much longer prompts. To replace these estimates with real numbers, log `completion.usage` (`prompt_tokens`, `completion_tokens`, and `completion_tokens_details.reasoning_tokens`) from `call_llm` for one session.
+**Planning figure: ~49k input + ~40k output per cycle** (10k visible + 30k reasoning), averaged over a 3-cycle session. Before literature grounding it was ~41k + ~39k. The original figure of 80k + 32k assumed roughly 6 calls per cycle and much longer prompts.
+
+### Measured tokens (Claude Opus 5.5, Danionella goal)
+
+A real 2-cycle session on `claude-opus-5-5` (long research goal + user references, literature-grounded reviews) was billed by Parley as follows. In/out splits are backed out from list prices ($4 / $20 per 1M) and the billed USD + total tokens:
+
+| Workload | Total tokens (Parley) | ≈ Input | ≈ Output | Billed USD | Wall time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cycle 1 | 159k | ~94k | ~65k | $1.67 | ~5.5 min |
+| Cycle 2 | 523k | ~328k | ~195k | $5.21 | ~15.3 min |
+| **Cycles 1+2** | **682k** | **~422k** | **~260k** | **$6.88** | **~20.8 min** |
+
+These volumes are much larger than the planning estimate (~49k + ~40k per cycle): the measured goal and hypotheses are long, and billed output includes thinking tokens. Prefer the measured Pareto plot below for budgeting; keep the planning plot as a lower-bound / short-goal reference.
 
 ## Cost vs science scatter (co-scientist use case)
 
-X = estimated USD per cycle (log scale), using ~49k input + ~40k output tokens. Each grey bar extends left to the cost with zero reasoning tokens (~49k in + ~10k out), which is the lower bound.  
+X = estimated USD at each model's list prices (log scale).  
 Y = Terminal-Bench-Science resolution %.  
-**★** = Pareto front (maximize science, minimize $/cycle). Only **measured** TB-Science points define the front. The front is the same at both ends of the reasoning-token range, because each model's input and output prices differ by about the same ratio.
+**★** = Pareto front (maximize science, minimize $). Only **measured** TB-Science points define the front.
+
+### Measured Opus 5.5 tokens (cycle 1 and cycles 1+2 on one plot)
+
+Each model is a horizontal bar: **left tick = cycle-1 cost** (~94k in + ~65k out), **right point = cycles 1+2 cost** (~422k in + ~260k out). Solid green front uses the session (1+2) dollars; dashed green front is the same models at cycle-1 dollars.
+
+| Model | TB-Science | $ / cycle 1 | $ / cycles 1+2 | Cycle-1 runs on $30 | Pareto |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `gpt-5.6-luna` | 3.3% | $0.10 | $0.40 | ~310 | ★ cheapest |
+| `gemini-3.8-flash` | 12.4% | $0.31 | $1.29 | ~95 | ★ best for ~$30 |
+| `gemini-3.7-flash` | 5.7% | $0.31 | $1.29 | ~95 | dominated by 3.8 Flash |
+| `gpt-5.6-terra` | 8.6% | $0.97 | $3.96 | ~31 | dominated by Flash |
+| `gpt-5.6-sol` | 22.4% | $1.68 | $6.89 | ~18 | dominated by Opus 5.5 |
+| `claude-opus-5-5` | 63.3% | $1.68 | $6.89 | ~18 | ★ best quality before Astra |
+| `claude-opus-5` | 30.0% | $2.09 | $8.61 | ~14 | dominated |
+| `claude-opus-4-8` | 10.5% | $2.09 | $8.61 | ~14 | dominated |
+| `gpt-6-astra` | 68.1% | $4.19 | $17.22 | ~7 | ★ highest science |
+
+![Cost vs TB-Science — measured Opus cycle 1 and cycles 1+2](parley-cost-science-pareto-opus-measured.png?v=2026-10-08b)
+
+Pareto polyline: **Luna → Gemini 3.8 Flash → Claude Opus 5.5 → GPT-6 Astra**.
+
+Opus 5.5 matches the Parley bills (~$1.67 / ~$6.88). Flash for the same tokens: ~$0.31 per cycle 1, ~$1.29 for cycles 1+2 (~23 two-cycle sessions on $30).
+
+**Pick on ~$30 (measured volumes):** stay at `gemini-3.8-flash` (~95 cycle-1 runs, or ~23 two-cycle sessions). Jump to `claude-opus-5-5` only if you need much higher measured science (~18 cycle-1 runs, or ~4 two-cycle sessions). Skip `gpt-6-astra` until budget grows.
+
+### Planning estimate (short-goal lower bound)
+
+X = estimated USD per cycle using ~49k input + ~40k output. Each grey bar extends left to the cost with zero reasoning tokens (~49k in + ~10k out). Real long-goal sessions (above) cost several times more.
 
 | Model | TB-Science | $ / cycle (no reasoning) | $ / cycle (incl. reasoning) | Cycles on $30 | Pareto |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -70,21 +110,13 @@ Y = Terminal-Bench-Science resolution %.
 | `claude-opus-4-8` | 10.5% | $0.50 | $1.25 | ~24 | dominated |
 | `gpt-6-astra` | 68.1% | $0.99 | $2.50 | ~12 | ★ highest science |
 
-“Cycles on $30” uses the cost including reasoning. With no reasoning tokens, it is about 2.5× more: for example ~400 Flash cycles or ~75 Opus 5.5 cycles. Per-cycle cost also rises over a session. For Flash it is about $0.08 in cycle 1 and $0.28 in cycle 3, including reasoning.
+![Cost vs Terminal-Bench-Science with Pareto front (planning estimate)](parley-cost-science-pareto.png?v=2026-10-08)
 
-### Scatter plot
-
-![Cost vs Terminal-Bench-Science with Pareto front](parley-cost-science-pareto.png?v=2026-10-07c)
-
-Pareto polyline (left → right): **Luna → Gemini 3.8 Flash → Claude Opus 5.5 → GPT-6 Astra**.
-
-**Pick on ~$30:** stay at `gemini-3.8-flash` on the front (~160 cycles). Jump to `claude-opus-5-5` only if you need much higher measured science (~30 cycles). Skip `gpt-6-astra` until budget grows.
-
-Both figures are generated by `scripts/make_parley_figures.py`; it also prints the numbers above. To regenerate them after changing an assumption:
+All figures are generated by `scripts/make_parley_figures.py` as PNG (embedded above) and PDF (same basename in `docs/`). It also prints the numbers above. To regenerate after changing an assumption:
 
 ```bash
-venv/bin/pip install matplotlib
-venv/bin/python scripts/make_parley_figures.py
+pip install matplotlib
+python scripts/make_parley_figures.py
 ```
 
 ## Ranked chat models (your Parley IDs)
@@ -120,12 +152,12 @@ venv/bin/python scripts/make_parley_figures.py
 
 | Priority | Model | Why |
 | --- | --- | --- |
-| **Best science / $** | `gemini-3.8-flash` | Measured 12.4% TB-Science, cheap intro rates (~$0.19 / cycle, ~160 cycles) |
-| **Best unmeasured bet** | `claude-sonnet-5-5` | No TB-Science score yet, but top-tier TB 4.0 at $2/$10 (~$0.50 / cycle, ~60 cycles) |
-| **Repo default** | `gpt-5-mini` | `openai_model` in `config.yaml`; fine for smoke tests (~$0.09 / cycle, ~324 cycles) |
-| **Avoid on $30** | `gpt-6-astra`, `claude-opus-5*`, `gpt-5.5` | High $/token; few cycles |
+| **Best science / $** | `gemini-3.8-flash` | Measured 12.4% TB-Science; ~$0.31 / cycle at Opus cycle-1 token volume (~95 cycles on $30) |
+| **Best unmeasured bet** | `claude-sonnet-5-5` | No TB-Science score yet, but top-tier TB 4.0 at $2/$10 |
+| **Repo default** | `gpt-5-mini` | `openai_model` in `config.yaml`; fine for smoke tests |
+| **Avoid on $30** | `gpt-6-astra`, `claude-opus-5*`, `gpt-5.5` | High $/token; ~18 Opus cycle-1 runs or ~4 two-cycle sessions on $30 |
 
-Per-cycle costs in this table use the same ~49k input + ~40k output estimate as the scatter plot.
+Budget figures above use the **measured Opus cycle-1 token volume**. The planning-estimate plot (~$0.19 Flash / cycle) is a short-goal lower bound.
 
 ## Older GPT pricing (not on TB-Science)
 

@@ -1,11 +1,11 @@
 """Regenerate the Parley cost figures used by docs/parley-models.md.
 
-    venv/bin/pip install matplotlib   # docs-only dependency
-    venv/bin/python scripts/make_parley_figures.py
+    pip install matplotlib   # docs-only dependency
+    python scripts/make_parley_figures.py
 
-Writes docs/parley-cycle-schematic.png and docs/parley-cost-science-pareto.png
-and prints the token/cost numbers quoted in the doc. Token counts are planning
-estimates derived from the prompt templates in app/agents.py, not measurements.
+Writes PNG and PDF versions of the cycle schematic (pastel agent colors),
+one combined measured Pareto plot (cycle-1 $ → cycles-1+2 $ as a range
+bar), and the planning-estimate Pareto plot.
 """
 
 from pathlib import Path
@@ -18,6 +18,17 @@ from matplotlib.patches import FancyBboxPatch  # noqa: E402
 from matplotlib.ticker import FuncFormatter, NullFormatter  # noqa: E402
 
 DOCS = Path(__file__).resolve().parent.parent / "docs"
+
+
+def _save_fig(fig, path: Path, *, facecolor: str) -> list[Path]:
+    """Write PNG (for the markdown preview) and a vector PDF beside it."""
+    path = Path(path)
+    written = []
+    for suffix in (".png", ".pdf"):
+        out = path.with_suffix(suffix)
+        fig.savefig(out, facecolor=facecolor)
+        written.append(out)
+    return written
 
 BG = "#0d1017"
 PANEL = "#161b24"
@@ -86,23 +97,68 @@ LABEL_OFFSETS = {
 }
 
 
-def _box(ax, x, y, w, h, title, sub, llm=True):
+# Pastel agent palette (matches the Gradio "Agent workflow" schematic).
+AGENT_COLORS = {
+    "generation": ("#d6eaf8", "#5dade2", "#1a5276"),  # fill, header, edge
+    "evolution": ("#fadbd8", "#ec7063", "#922b21"),
+    "reflection": ("#d5f5e3", "#58d68d", "#1e8449"),
+    "ranking": ("#fcf3cf", "#f4d03f", "#9a7d0a"),
+    "proximity": ("#e8daef", "#af7ac5", "#6c3483"),
+    "meta": ("#d1f2eb", "#48c9b0", "#0e6655"),
+    "local": ("#f4f6f7", "#aab7b8", "#566573"),
+}
+
+
+def _agent_box(ax, x, y, w, h, title, sub, palette):
+    fill, header, edge = palette
+    header_h = 3.6
     ax.add_patch(
         FancyBboxPatch(
             (x, y),
             w,
             h,
-            boxstyle="round,pad=0,rounding_size=1.2",
-            linewidth=2,
-            edgecolor=GREEN if llm else GRAY,
-            facecolor=LLM_FILL if llm else PANEL,
+            boxstyle="round,pad=0,rounding_size=0.8",
+            linewidth=1.2,
+            edgecolor=edge,
+            facecolor=fill,
         )
     )
-    ax.text(x + w / 2, y + h - 3.0, title, ha="center", va="center", color=TEXT, fontsize=12, weight="bold")
-    ax.text(x + w / 2, y + h - 5.4, sub, ha="center", va="top", color=MUTED, fontsize=9, linespacing=1.35)
+    ax.add_patch(
+        FancyBboxPatch(
+            (x, y + h - header_h),
+            w,
+            header_h,
+            boxstyle="round,pad=0,rounding_size=0.8",
+            linewidth=0,
+            facecolor=header,
+        )
+    )
+    # Square off the bottom of the header so it meets the body cleanly.
+    ax.add_patch(plt.Rectangle((x, y + h - header_h - 0.05), w, 1.2, linewidth=0, facecolor=header, zorder=2))
+    ax.text(
+        x + w / 2,
+        y + h - header_h / 2,
+        title,
+        ha="center",
+        va="center",
+        color="white",
+        fontsize=10,
+        weight="bold",
+        zorder=3,
+    )
+    ax.text(
+        x + w / 2,
+        y + (h - header_h) / 2 + 0.2,
+        sub,
+        ha="center",
+        va="center",
+        color="#2c3e50",
+        fontsize=8.5,
+        linespacing=1.3,
+    )
 
 
-def _arrow(ax, start, end, color=GREEN, style="-|>", ls="-"):
+def _arrow(ax, start, end, color="#7f8c8d", style="-|>", ls="-"):
     ax.annotate(
         "",
         xy=end,
@@ -111,107 +167,134 @@ def _arrow(ax, start, end, color=GREEN, style="-|>", ls="-"):
     )
 
 
-def draw_schematic(rows, avg_reasoning):
-    fig = plt.figure(figsize=(10.24, 6.46), dpi=100, facecolor=BG)
+def draw_schematic():
+    """Pipeline schematic in the pastel agent-workflow colorscheme (no token footer)."""
+    fig = plt.figure(figsize=(10.24, 4.6), dpi=100, facecolor="#f8f9f9")
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 100)
-    ax.set_ylim(0, 63)
+    ax.set_ylim(0, 46)
     ax.axis("off")
+    ax.set_facecolor("#f8f9f9")
 
-    ax.text(50, 59.5, "One Open AI Co-Scientist cycle", ha="center", color=TEXT, fontsize=18, weight="bold")
+    ax.text(50, 43.2, "One Open AI Co-Scientist cycle", ha="center", color="#1c2833", fontsize=17, weight="bold")
     ax.text(
         50,
-        56.0,
+        40.0,
         "Defaults: num_hypotheses = 4 · top_k = 2 · 3 matches per hypothesis   ·   "
-        "Green = LLM API calls   ·   Gray = local (no API cost)",
+        "Pastel cards = agents (purple Proximity is local, no API cost)",
         ha="center",
-        color=MUTED,
-        fontsize=9.5,
-    )
-
-    # 1. Generation step: evolution (from cycle 2) then fresh generation.
-    ax.add_patch(
-        FancyBboxPatch(
-            (2, 31.5),
-            36,
-            21,
-            boxstyle="round,pad=0,rounding_size=1.5",
-            linewidth=1.5,
-            edgecolor=GREEN,
-            facecolor="none",
-            linestyle="--",
-        )
-    )
-    ax.text(20, 50.6, "1. Generation step", ha="center", va="center", color=TEXT, fontsize=12, weight="bold")
-    _box(ax, 3.5, 34, 16, 14, "1a. Evolution", "cycle ≥ 2 · 4× LLM\nrefine / mutate /\nsimplify / hybridize")
-    _box(ax, 21, 34, 16, 14, "1b. New ideas", "1× LLM\nfresh hypotheses\nfrom the goal")
-    _arrow(ax, (19.5, 41), (21, 41))
-
-    _box(ax, 41, 34, 16, 14, "2. Reflection", "1× LLM per new hyp.\n+ free literature search\n(4 in cycle 1, then 8)")
-    _box(ax, 60, 34, 16, 14, "3. Tournament", "LLM judge per match\n≈ n × 3 / 2 matches\n+ Elo update (local)")
-    _box(ax, 79, 34, 18, 14, "4. Meta-review", "1× LLM over reviews\n+ match outcomes\n→ next evolution plan")
-    _box(ax, 79, 15, 18, 12, "5. Proximity", "local embeddings\nsimilarity graph", llm=False)
-
-    _arrow(ax, (38, 41), (41, 41))
-    _arrow(ax, (57, 41), (60, 41))
-    _arrow(ax, (76, 41), (79, 41))
-    _arrow(ax, (91, 34), (91, 27), color=GRAY)
-
-    # Feedback: this cycle's meta-review steers the next cycle's evolution.
-    ax.plot([84, 84, 11.5], [34, 29.5, 29.5], color=GREEN, lw=2, ls="--")
-    _arrow(ax, (11.5, 29.5), (11.5, 31.5), ls="--")
-    ax.text(
-        47,
-        28.6,
-        "next cycle: meta-review strategy picks the evolution operators and parents",
-        ha="center",
-        va="top",
-        color=GREEN,
+        color="#5d6d7e",
         fontsize=9,
     )
 
+    # 1. Generation step grouping.
     ax.add_patch(
         FancyBboxPatch(
-            (2, 1.5),
-            74,
-            22,
+            (2, 17.5),
+            36,
+            19.5,
             boxstyle="round,pad=0,rounding_size=1.2",
-            linewidth=1,
-            edgecolor="#30363d",
-            facecolor=PANEL,
+            linewidth=1.4,
+            edgecolor=AGENT_COLORS["generation"][2],
+            facecolor="#ebf5fb",
+            linestyle="--",
         )
     )
-    ax.text(4, 20.8, "LLM calls and tokens per cycle (estimates, not measured)", color=TEXT, fontsize=11, weight="bold")
-    notes = {
-        "Cycle 1": "no evolution yet",
-        "Cycle 2": "4 evolved + 4 new + 4 surviving",
-        "Cycle 3": "pool keeps growing; nothing is retired",
-    }
-    y = 17.4
-    for label, calls, tokens_in, tokens_out in rows:
-        ax.text(
-            4,
-            y,
-            f"• {label}: {calls} calls · ~{tokens_in / 1000:.0f}k in + ~{tokens_out / 1000:.0f}k visible out  ({notes[label]})",
-            color=MUTED,
-            fontsize=9.5,
-        )
-        y -= 3.2
     ax.text(
-        4,
-        y + 1.4,
-        f"• Reasoning models add hidden reasoning tokens billed as output:\n"
-        f"  ~{REASONING_PER_CALL:,} per call assumed → ~{avg_reasoning / 1000:.0f}k extra out per cycle on average",
-        color=MUTED,
-        fontsize=9.5,
-        va="top",
-        linespacing=1.4,
+        20,
+        34.8,
+        "1. Generation step",
+        ha="center",
+        va="center",
+        color=AGENT_COLORS["generation"][2],
+        fontsize=11,
+        weight="bold",
+    )
+    _agent_box(
+        ax,
+        3.5,
+        19.5,
+        16,
+        13.5,
+        "1a. Evolution",
+        "cycle ≥ 2 · 4× LLM\nrefine / mutate /\nsimplify / hybridize",
+        AGENT_COLORS["evolution"],
+    )
+    _agent_box(
+        ax,
+        21,
+        19.5,
+        16,
+        13.5,
+        "1b. New ideas",
+        "1× LLM\nfresh hypotheses\nfrom the goal",
+        AGENT_COLORS["generation"],
+    )
+    _arrow(ax, (19.5, 26.2), (21, 26.2), color=AGENT_COLORS["generation"][2])
+
+    _agent_box(
+        ax,
+        41,
+        19.5,
+        16,
+        13.5,
+        "2. Reflection",
+        "1× LLM per new hyp.\n+ free literature search\n(4 in cycle 1, then 8)",
+        AGENT_COLORS["reflection"],
+    )
+    _agent_box(
+        ax,
+        60,
+        19.5,
+        16,
+        13.5,
+        "3. Tournament",
+        "LLM judge per match\n≈ n × 3 / 2 matches\n+ Elo update (local)",
+        AGENT_COLORS["ranking"],
+    )
+    _agent_box(
+        ax,
+        79,
+        19.5,
+        18,
+        13.5,
+        "4. Meta-review",
+        "1× LLM over reviews\n+ match outcomes\n→ next evolution plan",
+        AGENT_COLORS["meta"],
+    )
+    _agent_box(
+        ax,
+        79,
+        3.5,
+        18,
+        11.5,
+        "5. Proximity",
+        "local embeddings\nsimilarity graph",
+        AGENT_COLORS["proximity"],
     )
 
-    out = DOCS / "parley-cycle-schematic.png"
-    fig.savefig(out, facecolor=BG)
+    _arrow(ax, (38, 26.2), (41, 26.2))
+    _arrow(ax, (57, 26.2), (60, 26.2))
+    _arrow(ax, (76, 26.2), (79, 26.2))
+    _arrow(ax, (88, 19.5), (88, 15), color=AGENT_COLORS["proximity"][2])
+
+    # Feedback: this cycle's meta-review steers the next cycle's evolution.
+    loop = AGENT_COLORS["meta"][2]
+    ax.plot([84, 84, 11.5], [19.5, 15.5, 15.5], color=loop, lw=2, ls="--")
+    _arrow(ax, (11.5, 15.5), (11.5, 17.5), color=loop, ls="--")
+    ax.text(
+        47,
+        14.2,
+        "Iterate: meta-review strategy picks the next cycle's evolution operators and parents",
+        ha="center",
+        va="top",
+        color=loop,
+        fontsize=9,
+    )
+
+    written = _save_fig(fig, DOCS / "parley-cycle-schematic.png", facecolor="#f8f9f9")
     plt.close(fig)
-    return out
+    return written
 
 
 def _pareto(points):
@@ -223,20 +306,196 @@ def _pareto(points):
     return front
 
 
-def draw_pareto(avg_in, avg_vis_out, avg_out):
+# Measured Claude Opus 5.5 token volumes from a real Danionella session
+# (Parley total tokens + billed USD; in/out split from list prices $4/$20).
+# Flash $ from same tokens at $0.75 / $3.75.
+OPUS_MEASURED = {
+    "cycle1": {
+        "in": 94_000,
+        "out": 65_000,
+        "total": 159_000,
+        "usd": 1.67,
+        "flash_usd": 0.31,
+        "minutes": 5.5,
+        "calls": 12,
+    },
+    "cycle2": {
+        "in": 328_000,
+        "out": 195_000,
+        "total": 523_000,
+        "usd": 5.21,
+        "flash_usd": 0.98,
+        "minutes": 15.3,
+        "calls": 33,
+    },
+}
+
+
+def _model_cost(tokens_in, tokens_out, price_in, price_out):
+    return tokens_in * price_in / 1e6 + tokens_out * price_out / 1e6
+
+
+def draw_measured_pareto_combined():
+    """One scatter: bar from cycle-1 $ to cycles-1+2 $; light pastel theme like the schematic."""
+    c1, c2 = OPUS_MEASURED["cycle1"], OPUS_MEASURED["cycle2"]
+    tin1, tout1 = c1["in"], c1["out"]
+    tin12, tout12 = c1["in"] + c2["in"], c1["out"] + c2["out"]
+
     points = []
     for label, tb, price_in, price_out in MODELS:
-        cost_in = avg_in * price_in / 1e6
         points.append(
             {
                 "label": label,
                 "tb": tb,
-                "cost": cost_in + avg_out * price_out / 1e6,
-                "cost_visible": cost_in + avg_vis_out * price_out / 1e6,
+                "cost_c1": _model_cost(tin1, tout1, price_in, price_out),
+                "cost": _model_cost(tin12, tout12, price_in, price_out),
             }
         )
     front = _pareto(points)
     front_labels = {p["label"] for p in front}
+
+    light_bg = "#f8f9f9"
+    ink = "#1c2833"
+    muted = "#5d6d7e"
+    grid = "#d5d8dc"
+    bar = "#85929e"
+    front_color = AGENT_COLORS["meta"][2]  # teal, matches meta-review card
+    front_soft = AGENT_COLORS["reflection"][1]  # green for cycle-1 dashed front
+    dominated_color = "#aab7b8"
+    panel = "#ffffff"
+
+    fig, ax = plt.subplots(figsize=(10.24, 6.77), dpi=100, facecolor=light_bg)
+    ax.set_facecolor(light_bg)
+    for spine in ax.spines.values():
+        spine.set_color("#bdc3c7")
+    ax.tick_params(colors=muted)
+    ax.grid(True, color=grid, lw=0.8)
+    ax.set_xscale("log")
+
+    for p in points:
+        ax.plot([p["cost_c1"], p["cost"]], [p["tb"], p["tb"]], color=bar, lw=1.8, alpha=0.75, zorder=2)
+        ax.plot(p["cost_c1"], p["tb"], marker="|", color=bar, ms=11, mew=1.8, zorder=3)
+    ax.plot(
+        [p["cost"] for p in front],
+        [p["tb"] for p in front],
+        color=front_color,
+        lw=2.5,
+        zorder=4,
+        label="Pareto front (cycles 1+2 $)",
+    )
+    ax.plot(
+        [p["cost_c1"] for p in front],
+        [p["tb"] for p in front],
+        color=front_soft,
+        lw=1.6,
+        ls="--",
+        alpha=0.9,
+        zorder=3,
+        label="Pareto front (cycle 1 $)",
+    )
+    dominated = [p for p in points if p["label"] not in front_labels]
+    ax.scatter(
+        [p["cost"] for p in dominated],
+        [p["tb"] for p in dominated],
+        s=70,
+        color=dominated_color,
+        edgecolor=light_bg,
+        zorder=5,
+        label="Dominated (at cycles 1+2 $)",
+    )
+    ax.scatter(
+        [p["cost"] for p in front],
+        [p["tb"] for p in front],
+        s=140,
+        color=front_color,
+        edgecolor="white",
+        linewidths=1.2,
+        zorder=6,
+        label="Pareto (at cycles 1+2 $)",
+    )
+    ax.plot([], [], color=bar, marker="|", ms=10, lw=1.5, label="Left = cycle 1 $ · bar → cycles 1+2 $")
+
+    for p in points:
+        dx, dy, ha = LABEL_OFFSETS.get(p["label"], (8, 6, "left"))
+        on_front = p["label"] in front_labels
+        ax.annotate(
+            p["label"],
+            (p["cost"], p["tb"]),
+            xytext=(dx, dy),
+            textcoords="offset points",
+            ha=ha,
+            color=ink if on_front else muted,
+            fontsize=10,
+            weight="bold" if on_front else "normal",
+        )
+
+    ticks = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20]
+    ax.set_xticks(ticks)
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:g}"))
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.set_xlim(0.05, 22)
+    ax.set_ylim(-2, 78)
+    ax.set_title(
+        "Parley models: cost vs science (measured Opus 5.5 tokens)",
+        color=ink,
+        fontsize=14,
+        pad=12,
+    )
+    ax.set_xlabel(
+        f"Est. USD, log scale · left tick = cycle 1 (~{tin1 / 1000:.0f}k in + ~{tout1 / 1000:.0f}k out) · "
+        f"right = cycles 1+2 (~{tin12 / 1000:.0f}k in + ~{tout12 / 1000:.0f}k out)",
+        color=ink,
+        fontsize=10,
+    )
+    ax.set_ylabel("Terminal-Bench-Science resolution rate (%)", color=ink, fontsize=11)
+    legend = ax.legend(loc="upper left", facecolor=panel, edgecolor="#bdc3c7", fontsize=8.5)
+    for text in legend.get_texts():
+        text.set_color(ink)
+    flash = next(p for p in points if p["label"] == "Gemini 3.8 Flash")
+    fig.text(
+        0.5,
+        0.012,
+        "Sources: Snorkel Terminal-Bench-Science · vendor list prices · "
+        "Opus 5.5 Danionella session (Parley bill + list-price in/out split) · "
+        f"${BUDGET_USD:.0f} ≈ {BUDGET_USD / flash['cost_c1']:.0f} Flash cycle-1 runs "
+        f"or ~{BUDGET_USD / flash['cost']:.0f} Flash two-cycle sessions",
+        ha="center",
+        color=muted,
+        fontsize=8,
+    )
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+
+    written = _save_fig(fig, DOCS / "parley-cost-science-pareto-opus-measured.png", facecolor=light_bg)
+    plt.close(fig)
+    return written, points, front
+
+
+def draw_pareto(
+    tokens_in,
+    tokens_out,
+    *,
+    filename,
+    title,
+    xlabel,
+    footer_extra,
+    tokens_vis_out=None,
+    xlim=(0.012, 12),
+    ticks=None,
+):
+    """Scatter of $/workload vs TB-Science. If tokens_vis_out is set, draw a grey
+    bar from visible-only cost to full (incl. reasoning) cost; otherwise a single
+    measured point (billed output already includes thinking)."""
+    if ticks is None:
+        ticks = [0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10]
+    points = []
+    for label, tb, price_in, price_out in MODELS:
+        cost_in = tokens_in * price_in / 1e6
+        cost = cost_in + tokens_out * price_out / 1e6
+        cost_visible = cost_in + (tokens_vis_out if tokens_vis_out is not None else tokens_out) * price_out / 1e6
+        points.append({"label": label, "tb": tb, "cost": cost, "cost_visible": cost_visible})
+    front = _pareto(points)
+    front_labels = {p["label"] for p in front}
+    show_range = tokens_vis_out is not None
 
     fig, ax = plt.subplots(figsize=(10.24, 6.77), dpi=100, facecolor=BG)
     ax.set_facecolor(BG)
@@ -246,9 +505,10 @@ def draw_pareto(avg_in, avg_vis_out, avg_out):
     ax.grid(True, color="#30363d", lw=0.8)
     ax.set_xscale("log")
 
-    for p in points:
-        ax.plot([p["cost_visible"], p["cost"]], [p["tb"], p["tb"]], color=GRAY, lw=1.5, alpha=0.6, zorder=2)
-        ax.plot(p["cost_visible"], p["tb"], marker="|", color=GRAY, ms=10, mew=1.5, zorder=2)
+    if show_range:
+        for p in points:
+            ax.plot([p["cost_visible"], p["cost"]], [p["tb"], p["tb"]], color=GRAY, lw=1.5, alpha=0.6, zorder=2)
+            ax.plot(p["cost_visible"], p["tb"], marker="|", color=GRAY, ms=10, mew=1.5, zorder=2)
     ax.plot([p["cost"] for p in front], [p["tb"] for p in front], color=GREEN, lw=2.5, zorder=3, label="Pareto front")
     dominated = [p for p in points if p["label"] not in front_labels]
     ax.scatter(
@@ -269,7 +529,8 @@ def draw_pareto(avg_in, avg_vis_out, avg_out):
         zorder=5,
         label="Pareto",
     )
-    ax.plot([], [], color=GRAY, marker="|", ms=10, lw=1.5, label="Range down to visible-output-only cost")
+    if show_range:
+        ax.plot([], [], color=GRAY, marker="|", ms=10, lw=1.5, label="Range down to visible-output-only cost")
 
     for p in points:
         dx, dy, ha = LABEL_OFFSETS.get(p["label"], (8, 6, "left"))
@@ -285,19 +546,13 @@ def draw_pareto(avg_in, avg_vis_out, avg_out):
             weight="bold" if on_front else "normal",
         )
 
-    ticks = [0.02, 0.05, 0.1, 0.2, 0.5, 1, 2]
     ax.set_xticks(ticks)
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:g}"))
     ax.xaxis.set_minor_formatter(NullFormatter())
-    ax.set_xlim(0.012, 4)
+    ax.set_xlim(*xlim)
     ax.set_ylim(-2, 78)
-    ax.set_title("Parley models: cost per cycle vs science-agent score", color=TEXT, fontsize=14, pad=12)
-    ax.set_xlabel(
-        f"Est. USD per cycle, log scale (avg of cycles 1–3: ~{avg_in / 1000:.0f}k in + "
-        f"~{avg_out / 1000:.0f}k out incl. reasoning)",
-        color=TEXT,
-        fontsize=11,
-    )
+    ax.set_title(title, color=TEXT, fontsize=14, pad=12)
+    ax.set_xlabel(xlabel, color=TEXT, fontsize=11)
     ax.set_ylabel("Terminal-Bench-Science resolution rate (%)", color=TEXT, fontsize=11)
     legend = ax.legend(loc="upper left", facecolor=PANEL, edgecolor="#30363d", fontsize=9)
     for text in legend.get_texts():
@@ -306,18 +561,24 @@ def draw_pareto(avg_in, avg_vis_out, avg_out):
     fig.text(
         0.5,
         0.012,
-        "Sources: Snorkel Terminal-Bench-Science · vendor list prices · tokens estimated from app/agents.py prompts · "
-        f"${BUDGET_USD:.0f} ≈ {BUDGET_USD / flash['cost']:.0f} Flash cycles",
+        "Sources: Snorkel Terminal-Bench-Science · vendor list prices · "
+        f"{footer_extra} · ${BUDGET_USD:.0f} ≈ {BUDGET_USD / flash['cost']:.0f} Flash runs at this token volume",
         ha="center",
         color=MUTED,
         fontsize=8.5,
     )
     fig.tight_layout(rect=(0, 0.03, 1, 1))
 
-    out = DOCS / "parley-cost-science-pareto.png"
-    fig.savefig(out, facecolor=BG)
+    written = _save_fig(fig, DOCS / filename, facecolor=BG)
     plt.close(fig)
-    return out, points, front
+    return written, points, front
+
+
+def _print_table(points, cost_label):
+    print(f"\n| Model | TB-Science | {cost_label} | Runs on $30 |")
+    for p in sorted(points, key=lambda p: p["cost"]):
+        print(f"| {p['label']} | {p['tb']}% | ${p['cost']:.2f} | ~{BUDGET_USD / p['cost']:.0f} |")
+    print("Pareto front:", " -> ".join(p["label"] for p in _pareto(points)))
 
 
 def main():
@@ -332,16 +593,53 @@ def main():
         print(f"{label}: {calls} calls, {tokens_in:,} in, {tokens_out:,} visible out")
     print(f"Average: {avg_calls:.0f} calls, {avg_in:,.0f} in, {avg_vis_out:,.0f} visible out, {avg_out:,.0f} out")
 
-    schematic = draw_schematic(rows, avg_reasoning)
-    pareto, points, front = draw_pareto(avg_in, avg_vis_out, avg_out)
-    print("\n| Model | TB-Science | $/cycle (visible only) | $/cycle (incl. reasoning) | Cycles on $30 |")
-    for p in sorted(points, key=lambda p: p["cost"]):
+    written: list[Path] = []
+    written.extend(draw_schematic())
+
+    pareto_m, points_m, front_m = draw_measured_pareto_combined()
+    written.extend(pareto_m)
+    print("\n=== Measured Opus (combined cycle 1 | cycles 1+2) ===")
+    print("| Model | TB-Science | $/cycle 1 | $/cycles 1+2 | Cycle-1 runs on $30 |")
+    for p in sorted(points_m, key=lambda p: p["cost"]):
         print(
-            f"| {p['label']} | {p['tb']}% | ${p['cost_visible']:.3f} | ${p['cost']:.2f} | "
-            f"~{BUDGET_USD / p['cost']:.0f} |"
+            f"| {p['label']} | {p['tb']}% | ${p['cost_c1']:.2f} | ${p['cost']:.2f} | "
+            f"~{BUDGET_USD / p['cost_c1']:.0f} |"
         )
+    print("Pareto front:", " -> ".join(p["label"] for p in front_m))
+
+    pareto, points, front = draw_pareto(
+        avg_in,
+        avg_out,
+        filename="parley-cost-science-pareto.png",
+        title="Parley models: cost per cycle vs science-agent score (planning estimate)",
+        xlabel=(
+            f"Est. USD per cycle, log scale (avg of cycles 1–3: ~{avg_in / 1000:.0f}k in + "
+            f"~{avg_out / 1000:.0f}k out incl. reasoning)"
+        ),
+        footer_extra="tokens estimated from app/agents.py prompts",
+        tokens_vis_out=avg_vis_out,
+        xlim=(0.012, 4),
+        ticks=[0.02, 0.05, 0.1, 0.2, 0.5, 1, 2],
+    )
+    written.extend(pareto)
+    print("\n=== Planning estimate (avg cycles 1–3) ===")
+    _print_table(points, "$/cycle")
     print("Pareto front:", " -> ".join(p["label"] for p in front))
-    print(f"Wrote {schematic}\nWrote {pareto}")
+
+    # Remove superseded single-workload measured plots if present.
+    for stale in (
+        "parley-cost-science-pareto-opus-cycle1.png",
+        "parley-cost-science-pareto-opus-cycles1-2.png",
+        "parley-cost-science-pareto-opus-cycle1.pdf",
+        "parley-cost-science-pareto-opus-cycles1-2.pdf",
+    ):
+        path = DOCS / stale
+        if path.exists():
+            path.unlink()
+            print(f"Removed {path}")
+
+    for path in written:
+        print(f"Wrote {path}")
 
 
 if __name__ == "__main__":

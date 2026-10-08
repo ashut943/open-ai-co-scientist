@@ -85,6 +85,41 @@ def test_missing_usage_field_is_ignored():
     assert meter.to_dict()["total"]["calls"] == 0
 
 
+def test_anthropic_style_usage_field_names():
+    meter = TokenUsage()
+    completion = MagicMock()
+    completion.usage = SimpleNamespace(input_tokens=5000, output_tokens=800, prompt_tokens=None, completion_tokens=None)
+    with track_usage(meter), usage_step("generation"):
+        utils._record_usage(completion)
+    assert meter.to_dict()["steps"]["generation"]["input_tokens"] == 5000
+    assert meter.to_dict()["steps"]["generation"]["output_tokens"] == 800
+
+
+def test_cached_prompt_tokens_are_added_when_prompt_tokens_is_a_stub():
+    """Parley + Opus reported prompt_tokens=4 with the real mass in cached_tokens."""
+    meter = TokenUsage()
+    completion = MagicMock()
+    completion.usage = SimpleNamespace(
+        prompt_tokens=4,
+        completion_tokens=7309,
+        total_tokens=22048,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=22033),
+        completion_tokens_details=None,
+    )
+    with track_usage(meter), usage_step("generation"):
+        utils._record_usage(completion)
+    assert meter.to_dict()["steps"]["generation"]["input_tokens"] == 22037  # 4 + 22033
+    assert meter.to_dict()["steps"]["generation"]["output_tokens"] == 7309
+
+
+def test_total_tokens_recovers_input_when_prompt_fields_are_wrong():
+    assert utils._extract_token_counts({"prompt_tokens": 4, "completion_tokens": 100, "total_tokens": 5100}) == (
+        5000,
+        100,
+        0,
+    )
+
+
 def test_run_cycle_stores_cycle_and_session_totals():
     context = ContextMemory()
     supervisor = SupervisorAgent()
