@@ -38,7 +38,7 @@ def _client_that(behavior):
     """Mocked OpenAI client whose create() dispatches on the model kwarg."""
     client = MagicMock()
 
-    def create(model=None, messages=None, temperature=None):
+    def create(model=None, messages=None, **kwargs):
         return behavior(model)
 
     client.chat.completions.create.side_effect = create
@@ -207,6 +207,17 @@ def test_primary_success_skips_fallback(monkeypatch):
 
 
 # --- OpenAI path: no automatic live free-model list ---
+
+
+def test_call_llm_leaves_temperature_at_provider_default(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
+    client = MagicMock()
+    client.chat.completions.create.return_value = _ok_completion("OK")
+
+    with patch.object(utils, "OpenAI", return_value=client):
+        assert call_llm("prompt", temperature=0.7, model="gpt-5-mini") == "OK"
+
+    assert "temperature" not in client.chat.completions.create.call_args.kwargs
 
 
 def test_openai_does_not_auto_fallback_to_live_free_models(monkeypatch):

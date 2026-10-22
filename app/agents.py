@@ -1,19 +1,90 @@
+import contextvars
 import json
 import math
 import random
-from typing import Dict, List, Tuple
+import re
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Dict, List, Tuple, TypeVar
 
 # Import necessary components from other modules
+from .config import config
 from .models import REVIEW_SCORE_KEYS, ContextMemory, Hypothesis, ResearchGoal
+from .tools.literature import (
+    LiteratureSearch,
+    crossref_doi_exists,
+    format_papers_block,
+    ground_references,
+    hypothesis_query,
+    literature_settings,
+    resolve_references,
+)
 from .utils import (
+    TokenUsage,
     call_llm,
     generate_unique_id,
     generate_visjs_data,
     logger,  # Use the logger configured in utils
     similarity_score,
+    track_usage,
+    usage_step,
 )
 
 # --- Agent-Specific LLM Calls (Moved from main.py/utils.py for better cohesion) ---
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+def _parallel_map(fn: Callable[[_T], _R], items: List[_T]) -> List[_R]:
+    """Run independent LLM calls up to `llm_max_concurrency` at a time; results keep input order."""
+    workers = min(len(items), max(1, int(config.get("llm_max_concurrency", 4) or 1)))
+    if workers <= 1:
+        return [fn(item) for item in items]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # Each task runs in a copy of the caller's context so token usage is attributed to its step.
+        futures = [pool.submit(contextvars.copy_context().run, fn, item) for item in items]
+        return [future.result() for future in futures]
+
+
+_SEARCH_KEYWORDS_INSTRUCTION = (
+    "a JSON list of 2-4 key phrases (1-3 words each) that a relevant paper must contain, most "
+    'important first, e.g. ["thermodynamic uncertainty relation", "feedback control", "Markov jump process"]. '
+    "Use field-standard vocabulary; no names coined in the hypothesis, no numbers or formulas."
+)
+_MAX_SEARCH_PHRASES = 4
+
+
+def _clean_search_keywords(value) -> str:
+    """Normalize the model's key phrases (list, or comma/semicolon string) to a quoted-phrase query.
+
+    e.g. ["dynamical activity", "transfer entropy"] -> '"dynamical activity" "transfer entropy"'.
+    Quotes let the arXiv search match phrases instead of loose words.
+    """
+    if isinstance(value, str):
+        value = re.split(r"[;,]", value)
+    if not isinstance(value, list):
+        return ""
+    phrases = []
+    for item in value:
+        phrase = " ".join(re.sub(r"[\"()]", " ", str(item)).split()[:4])
+        if phrase and phrase.lower() not in {p.lower() for p in phrases}:
+            phrases.append(phrase)
+    return " ".join(f'"{p}"' for p in phrases[:_MAX_SEARCH_PHRASES])
+
+
+# Group 1 is set for a valid JSON escape; \b \f \n \r \t followed by a letter are LaTeX (\frac, \nabla, \tau).
+_JSON_ESCAPE = re.compile(r'\\(["\\/]|u[0-9a-fA-F]{4}|[bfnrt](?![A-Za-z]))?')
+
+
+def _loads_llm_json(text: str):
+    """json.loads that tolerates what models often emit inside strings: raw newlines/tabs
+    and LaTeX written with single backslashes (e.g. "\\sigma")."""
+    try:
+        return json.loads(text, strict=False)
+    except json.JSONDecodeError as e:
+        if "Invalid \\escape" not in e.msg:
+            raise
+        return json.loads(_JSON_ESCAPE.sub(lambda m: m.group(0) if m.group(1) else "\\\\", text), strict=False)
 
 
 # Updated signature to accept temperature
@@ -21,15 +92,11 @@ def call_llm_for_generation(
     prompt: str, num_hypotheses: int = 3, temperature: float = 0.7, model: str | None = None
 ) -> List[Dict]:
     """Calls LLM for generating hypotheses, handling JSON parsing."""
-    logger.info(
-        "LLM generation called with prompt: %s, num_hypotheses: %d, temperature: %.2f",
-        prompt,
-        num_hypotheses,
-        temperature,
-    )
+    logger.info("LLM generation called with prompt: %s, num_hypotheses: %d", prompt, num_hypotheses)
     full_prompt = (
         prompt
-        + "\n\nPlease return the response as a JSON array of objects, where each object has a 'title' and 'text' key."
+        + "\n\nPlease return the response as a JSON array of objects, where each object has a 'title' and 'text' "
+        + f"key, plus a 'search_keywords' key: {_SEARCH_KEYWORDS_INSTRUCTION}"
     )
 
     # Pass the received temperature down to the actual LLM call
@@ -48,7 +115,7 @@ def call_llm_for_generation(
             response = response[:-3]
         response = response.strip()
 
-        hypotheses_data = json.loads(response)
+        hypotheses_data = _loads_llm_json(response)
 
         if not isinstance(hypotheses_data, list) or not all(
             isinstance(h, dict) and "title" in h and "text" in h for h in hypotheses_data
@@ -60,6 +127,9 @@ def call_llm_for_generation(
     except (json.JSONDecodeError, ValueError) as e:
         logger.error("Could not parse LLM generation response as JSON: %s", response, exc_info=True)
         return [{"title": "Error", "text": f"Could not parse LLM response: {e}"}]
+
+
+_LEGACY_ORDINAL_SCORES = {"HIGH": 5, "MEDIUM": 3, "LOW": 1}
 
 
 def _empty_review_scores() -> Dict[str, int]:
@@ -109,22 +179,52 @@ def call_llm_for_reflection(
     temperature: float = 0.5,
     model: str | None = None,
     research_goal: str | None = None,
+    literature: List[Dict] | None = None,
+    user_references: List[Dict] | None = None,
 ) -> Dict:
-    """Peer-review a hypothesis with numeric criterion scores and structured critique."""
-    logger.info("LLM reflection called with temperature: %.2f", temperature)
+    """Peer-review a hypothesis with numeric criterion scores and structured critique.
+
+    `literature` (retrieved papers, labelled P1..Pn) and `user_references`
+    (labelled U1..Un) ground the novelty/feasibility judgment and are the only
+    sources the reviewer may cite.
+    """
+    logger.info("LLM reflection called (model=%s, %d retrieved papers)", model, len(literature or []))
     goal_block = research_goal.strip() if research_goal else "Not provided."
     criteria = ", ".join(REVIEW_SCORE_KEYS)
+    evidence = ""
+    if user_references:
+        evidence += f"User-provided references and notes:\n{format_papers_block(user_references)}\n\n"
+    if literature:
+        evidence += (
+            "Retrieved literature (top search results for this hypothesis; may be incomplete):\n"
+            f"{format_papers_block(literature, label_prefix='P')}\n\n"
+        )
+    if evidence:
+        grounding = (
+            "Judge novelty against the papers above: if one already proposes or demonstrates the core idea, "
+            "novelty must be 1-2 and closest_prior_work must say which paper and how it overlaps. Use them to "
+            "judge feasibility (are the methods or materials already demonstrated?). Absence from these results "
+            "does not prove novelty. In references, cite ONLY the labels above (e.g. 'P2', 'U1'); citations to "
+            "anything else are discarded.\n"
+            "Search results can be off-topic: in relevant_papers list only the P labels of retrieved papers that "
+            "are actually about this hypothesis's subject, and ignore the others entirely.\n\n"
+        )
+    else:
+        evidence = "No literature was retrieved for this review.\n\n"
+        grounding = (
+            "Judge novelty from your own knowledge and say so in the comment. Only cite papers by DOI that you "
+            "are certain exist; citations that cannot be verified are discarded.\n\n"
+        )
     prompt = (
         f"You are a scientific peer reviewer.\n\n"
         f"Research goal:\n{goal_block}\n\n"
         f"Hypothesis:\n{hypothesis_text}\n\n"
+        f"{evidence}"
         f"Score the hypothesis from 1-5 on each criterion: {criteria}.\n"
         f"Also identify strengths, weaknesses, critical assumptions, falsification "
         f"conditions (what observation/experiment would refute it), safety/ethical "
         f"concerns, and recommended improvements.\n\n"
-        f"For references, provide arXiv IDs (e.g., '2301.12345'), DOIs, or paper "
-        f"titles with venues. Do not provide PubMed IDs unless this is specifically "
-        f"a biomedical/life-sciences hypothesis.\n\n"
+        f"{grounding}"
         f"Return ONLY a JSON object with keys:\n"
         f'  "review_scores": object with keys {list(REVIEW_SCORE_KEYS)} and integer values 1-5,\n'
         f'  "review_strengths": list of strings,\n'
@@ -133,31 +233,23 @@ def call_llm_for_reflection(
         f'  "falsification_conditions": list of strings,\n'
         f'  "safety_ethical_concerns": list of strings,\n'
         f'  "recommended_improvements": list of strings,\n'
+        f'  "closest_prior_work": list of strings, each "<label>: how it overlaps or differs",\n'
         f'  "comment": brief overall summary string,\n'
-        f'  "references": list of strings.\n'
+        f'  "references": list of strings'
+        + (
+            ',\n  "relevant_papers": list of P labels (e.g. ["P1", "P3"]); [] if none are relevant.\n'
+            if literature
+            else ".\n"
+        )
     )
     response = call_llm(prompt, temperature=temperature, model=model)
     logger.info("LLM reflection response for hypothesis: %s", response)
 
-    if response.startswith("Error:") or response.startswith("Authentication with"):
-        logger.error(f"LLM reflection call failed: {response}")
-        return {
-            "novelty_review": "Not reviewed",
-            "feasibility_review": "Not reviewed",
-            "review_scores": _empty_review_scores(),
-            "review_strengths": [],
-            "review_weaknesses": [],
-            "critical_assumptions": [],
-            "falsification_conditions": [],
-            "safety_ethical_concerns": [],
-            "recommended_improvements": [],
-            "comment": f"LLM review failed: {response}",
-            "references": [],
-        }
-
+    # "error" is None on success; otherwise the failure text, and the review
+    # fields stay empty ("Not reviewed") rather than holding invented ratings.
     review_data = {
-        "novelty_review": "MEDIUM",
-        "feasibility_review": "MEDIUM",
+        "novelty_review": "Not reviewed",
+        "feasibility_review": "Not reviewed",
         "review_scores": _empty_review_scores(),
         "review_strengths": [],
         "review_weaknesses": [],
@@ -165,35 +257,31 @@ def call_llm_for_reflection(
         "falsification_conditions": [],
         "safety_ethical_concerns": [],
         "recommended_improvements": [],
-        "comment": "Could not parse LLM response.",
+        "closest_prior_work": [],
+        "comment": "",
         "references": [],
+        "relevant_papers": None,  # None: the model did not judge relevance, so keep every retrieved paper
+        "error": None,
     }
 
+    if response.startswith("Error:") or response.startswith("Authentication with"):
+        logger.error(f"LLM reflection call failed: {response}")
+        review_data["error"] = response
+        return review_data
+
     try:
-        parsed_data = json.loads(_strip_json_fences(response))
+        parsed_data = _loads_llm_json(_strip_json_fences(response))
         raw_scores = parsed_data.get("review_scores", {})
         if not isinstance(raw_scores, dict):
             raw_scores = {}
-        scores: Dict[str, int] = {}
-        for key in REVIEW_SCORE_KEYS:
-            coerced = _coerce_score(raw_scores.get(key))
-            if coerced is not None:
-                scores[key] = coerced
-            else:
-                # Accept legacy HIGH/MEDIUM/LOW keys if a model still emits them.
-                legacy_key = f"{key}_review" if key in {"novelty", "feasibility"} else None
-                legacy_val = None
-                if legacy_key:
-                    legacy_val = parsed_data.get(legacy_key)
-                if key == "novelty":
-                    legacy_val = legacy_val or parsed_data.get("novelty_review")
-                if key == "feasibility":
-                    legacy_val = legacy_val or parsed_data.get("feasibility_review")
-                if isinstance(legacy_val, str):
-                    mapping = {"HIGH": 5, "MEDIUM": 3, "LOW": 1}
-                    scores[key] = mapping.get(legacy_val.upper(), 0)
-                else:
-                    scores[key] = 0
+        scores = {key: _coerce_score(raw_scores.get(key)) or 0 for key in REVIEW_SCORE_KEYS}
+        # Accept legacy HIGH/MEDIUM/LOW novelty/feasibility if a model still emits them.
+        for key in ("novelty", "feasibility"):
+            legacy = str(parsed_data.get(f"{key}_review", "")).upper()
+            if not scores[key] and legacy in _LEGACY_ORDINAL_SCORES:
+                scores[key] = _LEGACY_ORDINAL_SCORES[legacy]
+        if not any(scores.values()):
+            raise ValueError("no review scores in output")
         review_data["review_scores"] = scores
         review_data["novelty_review"] = _score_to_ordinal(scores.get("novelty"))
         review_data["feasibility_review"] = _score_to_ordinal(scores.get("feasibility"))
@@ -205,6 +293,7 @@ def call_llm_for_reflection(
             "falsification_conditions",
             "safety_ethical_concerns",
             "recommended_improvements",
+            "closest_prior_work",
         ):
             review_data[list_key] = _coerce_str_list(parsed_data.get(list_key))
 
@@ -212,22 +301,12 @@ def call_llm_for_reflection(
         review_data["comment"] = comment if isinstance(comment, str) else str(comment)
         references = parsed_data.get("references", [])
         review_data["references"] = references if isinstance(references, list) else []
-
-        # Legacy-only payloads: allow ordinal novelty/feasibility without review_scores.
-        if not any(scores.values()):
-            novelty = str(parsed_data.get("novelty_review", "MEDIUM")).upper()
-            feasibility = str(parsed_data.get("feasibility_review", "MEDIUM")).upper()
-            if novelty in {"HIGH", "MEDIUM", "LOW"}:
-                review_data["novelty_review"] = novelty
-                scores["novelty"] = {"HIGH": 5, "MEDIUM": 3, "LOW": 1}[novelty]
-            if feasibility in {"HIGH", "MEDIUM", "LOW"}:
-                review_data["feasibility_review"] = feasibility
-                scores["feasibility"] = {"HIGH": 5, "MEDIUM": 3, "LOW": 1}[feasibility]
-            review_data["review_scores"] = scores
+        if "relevant_papers" in parsed_data:
+            review_data["relevant_papers"] = _coerce_str_list(parsed_data.get("relevant_papers"))
 
     except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as e:
         logger.warning("Error parsing LLM reflection response: %s", response, exc_info=True)
-        review_data["comment"] = f"Could not parse LLM response: {e}"
+        review_data["error"] = f"Could not parse LLM response: {e}"
 
     logger.info("Parsed reflection data: %s", review_data)
     return review_data
@@ -257,6 +336,8 @@ def _format_hypothesis_reviews(hypothesis: Hypothesis) -> str:
         parts.append("Safety/ethics: " + "; ".join(hypothesis.safety_ethical_concerns))
     if hypothesis.recommended_improvements:
         parts.append("Recommended improvements: " + "; ".join(hypothesis.recommended_improvements))
+    if hypothesis.closest_prior_work:
+        parts.append("Closest prior work: " + "; ".join(hypothesis.closest_prior_work))
     if hypothesis.review_comments:
         parts.append(f"Comments: {'; '.join(hypothesis.review_comments)}")
     return "\n".join(parts) if parts else "No prior reviews available."
@@ -352,7 +433,7 @@ def judge_pair(
         }
 
     try:
-        parsed = json.loads(_strip_json_fences(response))
+        parsed = _loads_llm_json(_strip_json_fences(response))
         winner = str(parsed.get("winner", "")).upper().strip()
         if winner not in {"A", "B", "TIE"}:
             raise ValueError(f"Invalid winner value: {parsed.get('winner')!r}")
@@ -530,18 +611,52 @@ def _tournament_feedback_for(context: ContextMemory, hypothesis_ids: List[str]) 
     return "\n".join(lines) if lines else "No tournament feedback available yet."
 
 
+META_REVIEW_LIST_KEYS = (
+    "recurring_strengths",
+    "recurring_weaknesses",
+    "unexplored_mechanisms",
+    "shared_assumptions",
+    "contradictions",
+    "promising_hypothesis_pairs",
+    "research_gaps",
+    "recommended_evolution_strategy",
+)
+
+
+def _empty_meta_review() -> Dict:
+    return {key: [] for key in META_REVIEW_LIST_KEYS}
+
+
 def _latest_meta_review_summary(context: ContextMemory) -> str:
     if not context.meta_review_feedback:
-        return "No meta-review feedback from prior cycles yet."
+        return "No meta-review feedback available yet."
     latest = context.meta_review_feedback[-1]
-    critiques = latest.get("meta_review_critique") or []
-    next_steps = (latest.get("research_overview") or {}).get("suggested_next_steps") or []
     parts = []
+    for key in META_REVIEW_LIST_KEYS:
+        values = latest.get(key) or []
+        if not values:
+            continue
+        rendered = []
+        for item in values:
+            if isinstance(item, dict):
+                rendered.append(json.dumps(item, sort_keys=True))
+            else:
+                rendered.append(str(item))
+        parts.append(f"{key}: " + "; ".join(rendered))
+    critiques = latest.get("meta_review_critique") or []
     if critiques:
-        parts.append("Critiques: " + "; ".join(critiques))
-    if next_steps:
-        parts.append("Suggested next steps: " + "; ".join(next_steps))
-    return "\n".join(parts) if parts else "No meta-review feedback from prior cycles yet."
+        parts.append("Critiques: " + "; ".join(str(c) for c in critiques))
+    return "\n".join(parts) if parts else "No meta-review feedback available yet."
+
+
+def _user_references_block(research_goal: ResearchGoal) -> str:
+    """Prompt block for the user's own references; empty when there are none."""
+    if not research_goal.resolved_references:
+        return ""
+    return (
+        "User-provided references and notes (build on them; do not merely restate them):\n"
+        f"{format_papers_block(research_goal.resolved_references, abstract_chars=300)}\n\n"
+    )
 
 
 def _format_parent_block(hypothesis: Hypothesis) -> str:
@@ -583,12 +698,14 @@ def call_llm_for_evolution(
         f"{parent_blocks}\n\n"
         f"Tournament feedback involving parent(s):\n"
         f"{_tournament_feedback_for(context, parent_ids)}\n\n"
-        f"Meta-review feedback (from prior cycles if any):\n"
+        f"Latest meta-review guidance (should steer this evolution):\n"
         f"{_latest_meta_review_summary(context)}\n\n"
+        f"{_user_references_block(research_goal)}"
         f"Return ONLY a JSON object with keys:\n"
         f'  "title": short title for the NEW child hypothesis,\n'
         f'  "text": full statement of the NEW child hypothesis,\n'
-        f'  "reasoning": brief note of what changed and why.\n'
+        f'  "reasoning": brief note of what changed and why,\n'
+        f'  "search_keywords": {_SEARCH_KEYWORDS_INSTRUCTION}\n'
         f"Do not modify the parents in place; invent a distinct child.\n"
     )
 
@@ -600,7 +717,7 @@ def call_llm_for_evolution(
         return {"title": "Error", "text": response, "reasoning": ""}
 
     try:
-        parsed = json.loads(_strip_json_fences(response))
+        parsed = _loads_llm_json(_strip_json_fences(response))
         title = parsed.get("title")
         text = parsed.get("text")
         if not isinstance(title, str) or not title.strip() or not isinstance(text, str) or not text.strip():
@@ -608,7 +725,12 @@ def call_llm_for_evolution(
         reasoning = parsed.get("reasoning", "")
         if not isinstance(reasoning, str):
             reasoning = str(reasoning)
-        return {"title": title.strip(), "text": text.strip(), "reasoning": reasoning.strip()}
+        return {
+            "title": title.strip(),
+            "text": text.strip(),
+            "reasoning": reasoning.strip(),
+            "search_keywords": _clean_search_keywords(parsed.get("search_keywords")),
+        }
     except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
         logger.warning("Could not parse evolution response: %s", response, exc_info=True)
         return {"title": "Error", "text": f"Could not parse LLM response: {e}", "reasoning": ""}
@@ -619,11 +741,20 @@ def evolve_hypothesis(
     parents: List[Hypothesis],
     research_goal: ResearchGoal,
     context: ContextMemory,
+    errors: List[str] | None = None,
 ) -> Hypothesis | None:
-    """Create a new child hypothesis via an evolution operator. Never mutates parents."""
+    """Create a new child hypothesis via an evolution operator. Never mutates parents.
+
+    On failure returns None and, if `errors` is given, appends the cause to it.
+    """
     idea = call_llm_for_evolution(research_goal, operator, parents, context)
     if idea["title"] == "Error":
         logger.error("Skipping %s evolution: %s", operator, idea["text"])
+        if errors is not None:
+            errors.append(
+                f"{operator} evolution of {[p.hypothesis_id for p in parents]} failed "
+                f"(no child created): {idea['text']}"
+            )
         return None
 
     new_id = generate_unique_id("E")
@@ -633,6 +764,7 @@ def evolve_hypothesis(
     child = Hypothesis(new_id, idea["title"], idea["text"])
     child.parent_ids = [p.hypothesis_id for p in parents]
     child.evolution_operator = operator
+    child.search_keywords = idea.get("search_keywords", "")
     if idea["reasoning"]:
         child.review_comments.append(f"[{operator}] {idea['reasoning']}")
     logger.info(
@@ -668,6 +800,7 @@ class GenerationAgent:
         prompt = (
             f"Research Goal: {research_goal.description}\n"
             f"Constraints: {research_goal.constraints}\n"
+            f"{_user_references_block(research_goal)}"
             f"Existing Hypothesis IDs: {list(context.hypotheses.keys())}\n"  # Provide context
             f"Please propose {num_to_generate} novel and feasible hypotheses with rationale, avoiding duplication with existing IDs.\n"
         )
@@ -693,25 +826,83 @@ class GenerationAgent:
             while hypo_id in context.hypotheses:
                 hypo_id = generate_unique_id("G")
             h = Hypothesis(hypo_id, idea["title"], idea["text"])
+            h.search_keywords = _clean_search_keywords(idea.get("search_keywords"))
             logger.info("Generated hypothesis: %s", h.to_dict())
             new_hypos.append(h)
         return new_hypos, errors
 
 
+def _literature_summary(paper: Dict) -> Dict:
+    keys = ("source", "title", "year", "venue", "authors", "doi", "url")
+    return {key: paper.get(key) for key in keys}
+
+
+def _relevant_subset(papers: List[Dict], labels: List[str] | None) -> List[Dict]:
+    """Retrieved papers the reviewer marked relevant (P labels); all of them if it did not judge."""
+    if labels is None:
+        return papers
+    keep = set()
+    for label in labels:
+        match = re.match(r"\[?P(\d+)\]?", str(label).strip(), re.IGNORECASE)
+        if match and 1 <= int(match.group(1)) <= len(papers):
+            keep.add(int(match.group(1)) - 1)
+    return [paper for index, paper in enumerate(papers) if index in keep]
+
+
+def _summarize_literature_errors(errors: List[str]) -> List[str]:
+    """Collapse per-search failures into one message per distinct cause."""
+    counts: Dict[str, int] = {}
+    for message in errors:
+        counts[message] = counts.get(message, 0) + 1
+    return [f"{message} ({count} searches)" if count > 1 else message for message, count in counts.items()]
+
+
 class ReflectionAgent:
+    def __init__(self, literature: LiteratureSearch | None = None):
+        self.literature = literature or LiteratureSearch()
+
     def review_hypotheses(
         self, hypotheses: List[Hypothesis], context: ContextMemory, research_goal: ResearchGoal
-    ) -> None:
-        """Peer-review hypotheses with structured scores and scientific critique."""
-        reflect_temp = research_goal.reflection_temperature
+    ) -> List[str]:
+        """Peer-review hypotheses with structured scores and scientific critique.
 
-        for h in hypotheses:
+        Each review is grounded in a literature search for that hypothesis plus
+        the user's references; cited references are kept only if they map onto
+        those papers or a DOI that Crossref confirms. Returns error messages for
+        failed reviews and literature searches. A failed review leaves any
+        earlier successful review on the hypothesis untouched.
+        """
+        reflect_temp = research_goal.reflection_temperature
+        user_refs = research_goal.resolved_references or []
+        verify = crossref_doi_exists if literature_settings().get("verify_cited_dois", True) else None
+        failed: Dict[str, str] = {}
+        literature_errors: List[str] = []
+
+        def review(h: Hypothesis):
+            papers, search_errors = self.literature.search(h.search_keywords or hypothesis_query(h.title, h.text))
             result = call_llm_for_reflection(
                 h.text,
                 temperature=reflect_temp,
                 model=research_goal.llm_model,
                 research_goal=research_goal.description,
+                literature=papers,
+                user_references=user_refs,
             )
+            grounding = (
+                None
+                if result.get("error")
+                else ground_references(result["references"], papers, user_refs, verify_doi=verify)
+            )
+            return papers, search_errors, result, grounding
+
+        for h, (papers, search_errors, result, grounding) in zip(hypotheses, _parallel_map(review, hypotheses)):
+            literature_errors.extend(search_errors)
+            if result.get("error"):
+                failed[h.hypothesis_id] = result["error"]
+                if not _has_review(h):
+                    h.novelty_review = result["novelty_review"]
+                    h.feasibility_review = result["feasibility_review"]
+                continue
             h.novelty_review = result["novelty_review"]
             h.feasibility_review = result["feasibility_review"]
             h.review_scores = result.get("review_scores") or {}
@@ -721,10 +912,20 @@ class ReflectionAgent:
             h.falsification_conditions = result.get("falsification_conditions") or []
             h.safety_ethical_concerns = result.get("safety_ethical_concerns") or []
             h.recommended_improvements = result.get("recommended_improvements") or []
-            if result["comment"] not in {"Could not parse LLM response.", ""}:
+            h.closest_prior_work = result.get("closest_prior_work") or []
+            h.literature = [_literature_summary(p) for p in _relevant_subset(papers, result.get("relevant_papers"))]
+            h.literature_retrieved = len(papers)
+            if result["comment"]:
                 h.review_comments.append(result["comment"])
-            if result["references"]:
-                h.references.extend(result["references"])
+            grounded, dropped = grounding
+            for ref in grounded:
+                if ref not in h.references:
+                    h.references.append(ref)
+            if dropped:
+                h.review_comments.append(
+                    f"Dropped {dropped} cited reference(s) that did not match retrieved or user-provided "
+                    "papers and could not be verified."
+                )
             logger.info(
                 "Reviewed hypothesis: %s, Novelty: %s, Feasibility: %s, Scores: %s",
                 h.hypothesis_id,
@@ -733,33 +934,83 @@ class ReflectionAgent:
                 h.review_scores,
             )
 
+        errors = _summarize_literature_errors(literature_errors)
+        if failed:
+            reasons = " | ".join(dict.fromkeys(failed.values()))
+            errors.append(
+                f"Reflection review failed for {len(failed)} of {len(hypotheses)} hypotheses "
+                f"({', '.join(failed)}); they keep any earlier review, otherwise stay unreviewed: {reasons}"
+            )
+        return errors
+
+
+def _has_review(h: Hypothesis) -> bool:
+    return any((score or 0) > 0 for score in (h.review_scores or {}).values())
+
+
+def _select_tournament_pairs(
+    hypotheses: List[Hypothesis], matches_per_hypothesis: int | None
+) -> List[Tuple[Hypothesis, Hypothesis]]:
+    """Pick pairs so each hypothesis plays about `matches_per_hypothesis` matches.
+
+    Each pair is one LLM judge call, so a full round-robin (n*(n-1)/2) is only
+    used when the cap is unset/non-positive or already covers every pair.
+    """
+    all_pairs = [(hypotheses[i], hypotheses[j]) for i in range(len(hypotheses)) for j in range(i + 1, len(hypotheses))]
+    if not matches_per_hypothesis or matches_per_hypothesis <= 0 or matches_per_hypothesis >= len(hypotheses) - 1:
+        return all_pairs
+
+    random.shuffle(all_pairs)
+    counts = {h.hypothesis_id: 0 for h in hypotheses}
+    selected: List[Tuple[Hypothesis, Hypothesis]] = []
+    remaining: List[Tuple[Hypothesis, Hypothesis]] = []
+    for hA, hB in all_pairs:
+        if counts[hA.hypothesis_id] < matches_per_hypothesis and counts[hB.hypothesis_id] < matches_per_hypothesis:
+            selected.append((hA, hB))
+            counts[hA.hypothesis_id] += 1
+            counts[hB.hypothesis_id] += 1
+        else:
+            remaining.append((hA, hB))
+    for hA, hB in remaining:
+        if counts[hA.hypothesis_id] < matches_per_hypothesis or counts[hB.hypothesis_id] < matches_per_hypothesis:
+            selected.append((hA, hB))
+            counts[hA.hypothesis_id] += 1
+            counts[hB.hypothesis_id] += 1
+    return selected
+
 
 class RankingAgent:
-    def run_tournament(self, hypotheses: List[Hypothesis], context: ContextMemory, research_goal: ResearchGoal) -> None:
-        """Runs a pairwise tournament to rank hypotheses, using research_goal settings."""
+    def run_tournament(
+        self, hypotheses: List[Hypothesis], context: ContextMemory, research_goal: ResearchGoal
+    ) -> List[str]:
+        """Runs a pairwise tournament to rank hypotheses, using research_goal settings.
+
+        Returns an error message if any match fell back to the score-based
+        winner because the LLM judge failed.
+        """
         # Use k_factor from research_goal
         k_factor = research_goal.elo_k_factor
 
         if len(hypotheses) < 2:
             logger.info("Not enough hypotheses to run a tournament.")
-            return
+            return []
 
         active_hypotheses = [h for h in hypotheses if h.is_active]
         if len(active_hypotheses) < 2:
             logger.info("Not enough *active* hypotheses to run a tournament.")
-            return
+            return []
 
         random.shuffle(active_hypotheses)  # Shuffle only active ones
 
-        # Simple round-robin: each active hypothesis debates every other active one once
-        pairs = []
-        for i in range(len(active_hypotheses)):
-            for j in range(i + 1, len(active_hypotheses)):
-                pairs.append((active_hypotheses[i], active_hypotheses[j]))
+        pairs = _select_tournament_pairs(active_hypotheses, config.get("tournament_matches_per_hypothesis", 3))
 
         logger.info(f"Running tournament with {len(pairs)} pairs.")
-        for hA, hB in pairs:
-            winner, judgment = run_pairwise_debate(hA, hB, research_goal=research_goal)
+        judge_failures: List[str] = []
+        # The judge never sees Elo, so matches are judged concurrently and Elo is then updated in pair order.
+        verdicts = _parallel_map(lambda pair: run_pairwise_debate(*pair, research_goal=research_goal), pairs)
+        for (hA, hB), (winner, judgment) in zip(pairs, verdicts):
+            if judgment.get("fallback_reason"):
+                judge_failures.append(judgment["fallback_reason"])
             result_record = {
                 "iteration": context.iteration_number,
                 "hypothesis_a": hA.hypothesis_id,
@@ -789,46 +1040,158 @@ class RankingAgent:
                 result_record["loser_score_after"] = loser.elo_score
             context.tournament_results.append(result_record)
 
+        if not judge_failures:
+            return []
+        reasons = " | ".join(dict.fromkeys(judge_failures))
+        return [
+            f"Tournament judge failed for {len(judge_failures)} of {len(pairs)} matches; "
+            f"those winners were picked by the novelty/feasibility score fallback, not the LLM judge: {reasons}"
+        ]
+
+
+def _parse_operator_name(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    token = value.strip().upper()
+    for operator in EVOLUTION_OPERATORS:
+        if token == operator or token.startswith(operator + " ") or f" {operator} " in f" {token} ":
+            return operator
+    return None
+
+
+def _parent_ids_from_strategy_item(item) -> List[str]:
+    if isinstance(item, dict):
+        raw = item.get("parent_ids") or item.get("parents") or item.get("ids") or []
+        if isinstance(raw, str):
+            return [raw]
+        if isinstance(raw, list):
+            return [str(x) for x in raw if x]
+    return []
+
+
+def _pair_ids(item) -> List[str]:
+    if isinstance(item, (list, tuple)) and len(item) >= 2:
+        return [str(item[0]), str(item[1])]
+    if isinstance(item, dict):
+        ids = item.get("ids") or item.get("parent_ids") or item.get("pair") or []
+        if isinstance(ids, list) and len(ids) >= 2:
+            return [str(ids[0]), str(ids[1])]
+        a, b = item.get("a") or item.get("hypothesis_a"), item.get("b") or item.get("hypothesis_b")
+        if a and b:
+            return [str(a), str(b)]
+    if isinstance(item, str) and ("+" in item or " and " in item.lower()):
+        parts = [p.strip() for p in item.replace("+", " and ").split(" and ") if p.strip()]
+        if len(parts) >= 2:
+            return parts[:2]
+    return []
+
+
+def _plan_evolutions_from_meta(
+    meta: Dict,
+    top_candidates: List[Hypothesis],
+    context: ContextMemory,
+    max_ops: int = 4,
+) -> List[Tuple[str, List[Hypothesis]]]:
+    """Turn meta-review strategy/pairs into concrete (operator, parents) plans."""
+    by_id = {h.hypothesis_id: h for h in context.get_active_hypotheses()}
+    planned: List[Tuple[str, List[Hypothesis]]] = []
+    seen: set[tuple] = set()
+
+    def add(operator: str, parents: List[Hypothesis]) -> None:
+        if len(planned) >= max_ops or not parents:
+            return
+        if operator == "HYBRIDIZE" and len(parents) < 2:
+            return
+        if operator != "HYBRIDIZE":
+            parents = parents[:1]
+        key = (operator, tuple(p.hypothesis_id for p in parents))
+        if key in seen:
+            return
+        seen.add(key)
+        planned.append((operator, parents))
+
+    for item in meta.get("recommended_evolution_strategy") or []:
+        if isinstance(item, dict):
+            operator = _parse_operator_name(item.get("operator") or item.get("strategy") or "")
+            parent_ids = _parent_ids_from_strategy_item(item)
+        else:
+            operator = _parse_operator_name(str(item))
+            parent_ids = []
+        if not operator:
+            continue
+        parents = [by_id[pid] for pid in parent_ids if pid in by_id]
+        if not parents and top_candidates:
+            if operator == "HYBRIDIZE" and len(top_candidates) >= 2:
+                parents = top_candidates[:2]
+            else:
+                parents = [top_candidates[0]]
+        add(operator, parents)
+
+    for item in meta.get("promising_hypothesis_pairs") or []:
+        ids = _pair_ids(item)
+        parents = [by_id[pid] for pid in ids if pid in by_id]
+        if len(parents) >= 2:
+            add("HYBRIDIZE", parents[:2])
+
+    return planned
+
+
+def _default_evolution_plan(top_candidates: List[Hypothesis]) -> List[Tuple[str, List[Hypothesis]]]:
+    if not top_candidates:
+        return []
+    primary = top_candidates[0]
+    plan: List[Tuple[str, List[Hypothesis]]] = [
+        ("REFINE", [primary]),
+        ("MUTATE", [primary]),
+        ("SIMPLIFY", [primary]),
+    ]
+    if len(top_candidates) >= 2:
+        plan.append(("HYBRIDIZE", [top_candidates[0], top_candidates[1]]))
+    return plan
+
 
 class EvolutionAgent:
-    def evolve_hypotheses(self, context: ContextMemory, research_goal: ResearchGoal) -> List[Hypothesis]:
-        """Evolve top hypotheses into new children via LLM operators.
+    def evolve_hypotheses(
+        self, context: ContextMemory, research_goal: ResearchGoal
+    ) -> Tuple[List[Hypothesis], List[str]]:
+        """Evolve hypotheses into new children via LLM operators.
 
-        Operators (each creates a distinct child; parents are never mutated):
-          REFINE / MUTATE / SIMPLIFY on the top-ranked hypothesis
-          HYBRIDIZE on the top two when available
-
-        Uses research goal, reflection reviews, tournament feedback, and any
-        prior-cycle meta-review stored on the context.
+        Prefers the latest meta-review's recommended_evolution_strategy and
+        promising_hypothesis_pairs; falls back to REFINE/MUTATE/SIMPLIFY on the
+        top-ranked hypothesis and HYBRIDIZE on the top two. Parents are never mutated.
+        Returns (children, errors) where errors describe operators that failed.
         """
         top_k = research_goal.top_k_hypotheses
         active = context.get_active_hypotheses()
         if not active:
             logger.info("No active hypotheses to evolve.")
-            return []
+            return [], []
 
         top_candidates = sorted(active, key=lambda h: h.elo_score, reverse=True)[: max(1, top_k)]
-        primary = top_candidates[0]
-        new_hypotheses: List[Hypothesis] = []
+        meta = context.meta_review_feedback[-1] if context.meta_review_feedback else {}
+        planned = _plan_evolutions_from_meta(meta, top_candidates, context)
+        if not planned:
+            planned = _default_evolution_plan(top_candidates)
+            logger.info("No usable meta-review evolution plan; using defaults.")
+        else:
+            logger.info(
+                "Using meta-review-guided evolution plan: %s",
+                [(op, [p.hypothesis_id for p in parents]) for op, parents in planned],
+            )
 
-        for operator in ("REFINE", "MUTATE", "SIMPLIFY"):
-            child = evolve_hypothesis(operator, [primary], research_goal, context)
+        new_hypotheses: List[Hypothesis] = []
+        errors: List[str] = []
+        for operator, parents in planned:
+            child = evolve_hypothesis(operator, parents, research_goal, context, errors=errors)
             if child is not None:
                 new_hypotheses.append(child)
 
-        if len(top_candidates) >= 2:
-            hybrid = evolve_hypothesis("HYBRIDIZE", [top_candidates[0], top_candidates[1]], research_goal, context)
-            if hybrid is not None:
-                new_hypotheses.append(hybrid)
-        else:
-            logger.info("Skipping HYBRIDIZE: need at least two active hypotheses.")
-
         logger.info(
-            "Evolution produced %d child hypotheses from top candidates %s",
+            "Evolution produced %d child hypotheses from plan on top candidates %s",
             len(new_hypotheses),
             [h.hypothesis_id for h in top_candidates],
         )
-        return new_hypotheses
+        return new_hypotheses, errors
 
 
 class ProximityAgent:
@@ -860,49 +1223,197 @@ class ProximityAgent:
         return {"adjacency_graph": adjacency, "nodes": visjs_data["nodes"], "edges": visjs_data["edges"]}
 
 
+def _hypothesis_meta_snapshot(hypothesis: Hypothesis) -> str:
+    scores = ""
+    if hypothesis.review_scores:
+        scores = ", ".join(f"{k}={v}" for k, v in hypothesis.review_scores.items() if v)
+    return (
+        f"- {hypothesis.hypothesis_id} | Elo={hypothesis.elo_score:.1f} | "
+        f"Novelty={hypothesis.novelty_review} | Feasibility={hypothesis.feasibility_review}\n"
+        f"  Title: {hypothesis.title}\n"
+        f"  Text: {hypothesis.text}\n"
+        f"  Scores: {scores or 'n/a'}\n"
+        f"  Weaknesses: {'; '.join(hypothesis.review_weaknesses) or 'n/a'}\n"
+        f"  Critical assumptions: {'; '.join(hypothesis.critical_assumptions) or 'n/a'}\n"
+        f"  Falsification: {'; '.join(hypothesis.falsification_conditions) or 'n/a'}"
+    )
+
+
+def _rule_based_meta_review(active_hypotheses: List[Hypothesis]) -> Dict:
+    """Offline/fallback meta-review when the LLM call fails."""
+    meta = _empty_meta_review()
+    for h in active_hypotheses:
+        if h.review_strengths:
+            meta["recurring_strengths"].extend(h.review_strengths[:2])
+        if h.review_weaknesses:
+            meta["recurring_weaknesses"].extend(h.review_weaknesses[:2])
+        if h.critical_assumptions:
+            meta["shared_assumptions"].extend(h.critical_assumptions[:2])
+        if h.novelty_review == "LOW" or (h.review_scores.get("novelty") or 0) <= 2:
+            meta["recurring_weaknesses"].append(f"{h.hypothesis_id}: low novelty")
+        if h.feasibility_review == "LOW" or (h.review_scores.get("feasibility") or 0) <= 2:
+            meta["recurring_weaknesses"].append(f"{h.hypothesis_id}: low feasibility")
+    ranked = sorted(active_hypotheses, key=lambda h: h.elo_score, reverse=True)
+    if ranked:
+        meta["recommended_evolution_strategy"] = [
+            {"operator": "REFINE", "parent_ids": [ranked[0].hypothesis_id]},
+            {"operator": "MUTATE", "parent_ids": [ranked[0].hypothesis_id]},
+            {"operator": "SIMPLIFY", "parent_ids": [ranked[0].hypothesis_id]},
+        ]
+        if len(ranked) >= 2:
+            pair = [ranked[0].hypothesis_id, ranked[1].hypothesis_id]
+            meta["promising_hypothesis_pairs"].append({"ids": pair, "reason": "Top Elo pair"})
+            meta["recommended_evolution_strategy"].append({"operator": "HYBRIDIZE", "parent_ids": pair})
+    return meta
+
+
+def call_llm_for_meta_review(
+    research_goal: ResearchGoal,
+    context: ContextMemory,
+    adjacency: Dict | None = None,
+) -> Dict:
+    """LLM meta-review over current hypotheses, reviews, and tournament outcomes."""
+    active = context.get_active_hypotheses()
+    if not active:
+        return _empty_meta_review()
+
+    hypo_block = "\n".join(_hypothesis_meta_snapshot(h) for h in active)
+    tournament_lines = []
+    for result in context.tournament_results[-30:]:
+        judgment = result.get("judgment") or {}
+        if result.get("tie"):
+            tournament_lines.append(
+                f"Tie {result.get('hypothesis_a')} vs {result.get('hypothesis_b')}: {judgment.get('reasoning', '')}"
+            )
+        else:
+            tournament_lines.append(
+                f"{result.get('winner')} beat {result.get('loser')}: {judgment.get('reasoning', '')}"
+            )
+    tournament_block = "\n".join(tournament_lines) if tournament_lines else "No tournament results yet."
+    adjacency_note = "Not available."
+    if adjacency:
+        adjacency_note = f"{len(adjacency)} nodes in proximity graph (similarity links among active hypotheses)."
+
+    prompt = (
+        f"You are conducting a meta-review of a scientific hypothesis tournament.\n\n"
+        f"Research goal:\n{research_goal.description}\n\n"
+        f"Constraints: {research_goal.constraints}\n\n"
+        f"Current hypotheses and reflection reviews:\n{hypo_block}\n\n"
+        f"Recent tournament outcomes:\n{tournament_block}\n\n"
+        f"Proximity/similarity context: {adjacency_note}\n\n"
+        f"Analyze recurring themes across reviews and matches. Identify strengths, "
+        f"weaknesses, unexplored mechanisms, shared assumptions, contradictions, "
+        f"promising pairs to hybridize, research gaps, and a concrete evolution strategy.\n\n"
+        f"Return ONLY a JSON object with these keys (all lists):\n"
+        f'  "recurring_strengths": strings,\n'
+        f'  "recurring_weaknesses": strings,\n'
+        f'  "unexplored_mechanisms": strings,\n'
+        f'  "shared_assumptions": strings,\n'
+        f'  "contradictions": strings,\n'
+        f'  "promising_hypothesis_pairs": objects like '
+        f'{{"ids": ["H1", "H2"], "reason": "..."}},\n'
+        f'  "research_gaps": strings,\n'
+        f'  "recommended_evolution_strategy": objects like '
+        f'{{"operator": "REFINE"|"MUTATE"|"HYBRIDIZE"|"SIMPLIFY", '
+        f'"parent_ids": ["H1"], "rationale": "..."}}.\n'
+        f"Use real hypothesis IDs from the list above. Prefer at most 4 evolution actions.\n"
+    )
+
+    response = call_llm(
+        prompt,
+        temperature=research_goal.reflection_temperature,
+        model=research_goal.llm_model,
+    )
+    logger.info("Meta-review LLM response: %s", response)
+
+    if response.startswith("Error:") or response.startswith("Authentication with"):
+        logger.error("Meta-review LLM call failed: %s", response)
+        fallback = _rule_based_meta_review(active)
+        fallback["fallback_reason"] = response
+        return fallback
+
+    try:
+        parsed = _loads_llm_json(_strip_json_fences(response))
+        if not isinstance(parsed, dict):
+            raise ValueError("Meta-review response is not a JSON object")
+        meta = _empty_meta_review()
+        for key in META_REVIEW_LIST_KEYS:
+            value = parsed.get(key, [])
+            if value is None:
+                value = []
+            if not isinstance(value, list):
+                value = [value]
+            meta[key] = value
+        return meta
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
+        logger.warning("Could not parse meta-review response: %s", response, exc_info=True)
+        fallback = _rule_based_meta_review(active)
+        fallback["fallback_reason"] = f"Could not parse LLM response: {e}"
+        return fallback
+
+
 class MetaReviewAgent:
-    def summarize_and_feedback(self, context: ContextMemory, adjacency: Dict) -> Dict:
-        """Summarizes research state and provides feedback."""
+    def summarize_and_feedback(
+        self,
+        context: ContextMemory,
+        adjacency: Dict | None = None,
+        research_goal: ResearchGoal | None = None,
+    ) -> Dict:
+        """LLM meta-review that steers the next evolution step.
+
+        Returns both the rich analysis fields and legacy UI keys
+        (`meta_review_critique`, `research_overview`).
+        """
         active_hypotheses = context.get_active_hypotheses()
         if not active_hypotheses:
-            return {
+            overview = {
+                **_empty_meta_review(),
                 "meta_review_critique": ["No active hypotheses."],
                 "research_overview": {"top_ranked_hypotheses": [], "suggested_next_steps": []},
             }
+            context.meta_review_feedback.append(overview)
+            return overview
 
-        comment_summary = set()
-        for h in active_hypotheses:
-            if h.novelty_review == "LOW" or (h.review_scores.get("novelty") or 0) <= 2:
-                comment_summary.add("Some ideas lack novelty.")
-            if h.feasibility_review == "LOW" or (h.review_scores.get("feasibility") or 0) <= 2:
-                comment_summary.add("Some ideas may have low feasibility.")
-            if (h.review_scores.get("testability") or 0) <= 2:
-                comment_summary.add("Some ideas are weakly testable or hard to falsify.")
-            if h.safety_ethical_concerns:
-                comment_summary.add("Safety or ethical concerns were raised for one or more hypotheses.")
-            if h.critical_assumptions:
-                comment_summary.add("Critical assumptions should be examined before investing further.")
+        if research_goal is None:
+            # Tests/callers may omit the goal; synthesize a minimal placeholder.
+            research_goal = ResearchGoal(description="(unspecified research goal)")
 
+        meta = call_llm_for_meta_review(research_goal, context, adjacency=adjacency)
         best_hypotheses = sorted(active_hypotheses, key=lambda h: h.elo_score, reverse=True)[:3]
-        logger.info("Top hypotheses for meta-review: %s", [h.hypothesis_id for h in best_hypotheses])
 
-        next_steps = [
-            "Refine top hypotheses using recommended improvements and weaknesses from reflection.",
-            "Probe critical assumptions and design tests aimed at falsification conditions.",
-            "Consider exploring areas with fewer, less connected hypotheses (if any).",
-            "Seek external expert feedback on top candidates.",
-        ]
-        if not comment_summary:
-            comment_summary.add("Overall hypothesis quality seems reasonable based on automated review.")
+        critique: List[str] = []
+        for key in ("recurring_weaknesses", "contradictions", "research_gaps", "shared_assumptions"):
+            for item in meta.get(key) or []:
+                critique.append(f"{key}: {item if not isinstance(item, dict) else json.dumps(item)}")
+        if not critique:
+            critique.append("No major recurring issues identified by meta-review.")
+
+        next_steps: List[str] = []
+        for item in meta.get("recommended_evolution_strategy") or []:
+            if isinstance(item, dict):
+                op = item.get("operator", "EVOLVE")
+                parents = item.get("parent_ids") or item.get("ids") or []
+                rationale = item.get("rationale") or item.get("reason") or ""
+                next_steps.append(f"{op} on {parents}" + (f" — {rationale}" if rationale else ""))
+            else:
+                next_steps.append(str(item))
+        for item in meta.get("unexplored_mechanisms") or []:
+            next_steps.append(f"Explore unexplored mechanism: {item}")
+        if not next_steps:
+            next_steps = [
+                "Refine top hypotheses using reflection weaknesses and recommended improvements.",
+                "Probe critical assumptions and design falsification tests.",
+            ]
 
         overview = {
-            "meta_review_critique": list(comment_summary),
+            **meta,
+            "meta_review_critique": critique,
             "research_overview": {
-                "top_ranked_hypotheses": [h.to_dict() for h in best_hypotheses],  # Use to_dict for serialization
+                "top_ranked_hypotheses": [h.to_dict() for h in best_hypotheses],
                 "suggested_next_steps": next_steps,
             },
         }
-        context.meta_review_feedback.append(overview)  # Store feedback in context
+        context.meta_review_feedback.append(overview)
         logger.info("Meta-review complete: %s", overview)
         return overview
 
@@ -919,77 +1430,108 @@ class SupervisorAgent:
         self.meta_review_agent = MetaReviewAgent()
 
     def run_cycle(self, research_goal: ResearchGoal, context: ContextMemory) -> Dict:
-        """Runs a single cycle of hypothesis generation and refinement."""
+        """Run one coherent feedback cycle.
+
+        Order: Generation (evolved children of the previous cycle's meta-review
+        + fresh ideas) → Reflection → Tournament → Meta-review → Proximity.
+        The meta-review at the end of a cycle steers the next cycle's evolution,
+        so the first cycle has no evolved children. Token usage per step is
+        recorded in cycle_details["token_usage"].
+        """
+        meter = TokenUsage()
+        with track_usage(meter):
+            cycle_details = self._run_cycle_steps(research_goal, context)
+        usage = meter.to_dict()
+        context.token_usage.append(usage["total"])
+        usage["session_total"] = {
+            field: sum(cycle.get(field, 0) for cycle in context.token_usage) for field in TokenUsage.FIELDS
+        }
+        cycle_details["token_usage"] = usage
+        return cycle_details
+
+    def _run_cycle_steps(self, research_goal: ResearchGoal, context: ContextMemory) -> Dict:
         logger.info("--- Starting Cycle %d ---", context.iteration_number + 1)
         cycle_details = {"iteration": context.iteration_number + 1, "steps": {}, "meta_review": {}}
 
-        # 1. Generation
-        logger.info("Step 1: Generation")
-        new_hypotheses, generation_errors = self.generation_agent.generate_new_hypotheses(research_goal, context)
-        for nh in new_hypotheses:
-            context.add_hypothesis(nh)  # Add to central context
-        cycle_details["steps"]["generation"] = {"hypotheses": [h.to_dict() for h in new_hypotheses]}
+        # Every step's failures are collected here so the UI can show them;
+        # fallbacks keep the cycle running but must not look like success.
+        errors: List[str] = []
 
-        # Propagate LLM errors to top-level errors field for frontend display, so a
-        # generation failure surfaces its real cause instead of an empty ranking.
-        if generation_errors:
-            cycle_details["errors"] = generation_errors
+        # 0. Resolve the user's references once per research goal.
+        if research_goal.resolved_references is None:
+            research_goal.resolved_references, reference_errors = resolve_references(research_goal.user_references)
+            errors += reference_errors
+        cycle_details["user_references"] = research_goal.resolved_references
 
-        # Get all active hypotheses for subsequent steps
-        active_hypos = context.get_active_hypotheses()
-
-        # 2. Reflection
-        logger.info("Step 2: Reflection")
-        self.reflection_agent.review_hypotheses(active_hypos, context, research_goal)  # Pass research_goal
-        cycle_details["steps"]["reflection"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
-
-        # 3. Ranking (Tournament 1)
-        logger.info("Step 3: Ranking 1")
-        self.ranking_agent.run_tournament(active_hypos, context, research_goal)  # Pass research_goal
-        cycle_details["steps"]["ranking1"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
-
-        # 4. Evolution
-        logger.info("Step 4: Evolution")
-        evolved_hypotheses = self.evolution_agent.evolve_hypotheses(context, research_goal)  # Pass research_goal
-        if evolved_hypotheses:
+        # 1. Generation. Evolution runs before fresh generation so its top
+        # candidates are ranked hypotheses, not unjudged new ones at default Elo.
+        logger.info("Step 1: Generation (evolution + new hypotheses)")
+        if context.meta_review_feedback:
+            with usage_step("evolution"):
+                evolved_hypotheses, evolution_errors = self.evolution_agent.evolve_hypotheses(context, research_goal)
+            errors += evolution_errors
             for eh in evolved_hypotheses:
                 context.add_hypothesis(eh)
-            logger.info("Step 4a: Reviewing Evolved Hypotheses")
-            self.reflection_agent.review_hypotheses(evolved_hypotheses, context, research_goal)  # Pass research_goal
-            active_hypos = context.get_active_hypotheses()  # Update active list
             cycle_details["steps"]["evolution"] = {"hypotheses": [h.to_dict() for h in evolved_hypotheses]}
-            # Add explicit step for reviewing evolved hypotheses AFTER evolution
-            cycle_details["steps"]["reflection_evolved"] = {"hypotheses": [h.to_dict() for h in evolved_hypotheses]}
         else:
-            cycle_details["steps"]["evolution"] = {"hypotheses": []}
+            cycle_details["steps"]["evolution"] = {
+                "hypotheses": [],
+                "skipped_reason": "First cycle: evolution starts next cycle, guided by this cycle's meta-review.",
+            }
 
-        # 5. Ranking (Tournament 2 - includes evolved)
-        logger.info("Step 5: Ranking 2")
-        self.ranking_agent.run_tournament(active_hypos, context, research_goal)  # Pass research_goal
-        cycle_details["steps"]["ranking2"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
+        with usage_step("generation"):
+            new_hypotheses, generation_errors = self.generation_agent.generate_new_hypotheses(research_goal, context)
+        errors += generation_errors
+        for nh in new_hypotheses:
+            context.add_hypothesis(nh)
+        cycle_details["steps"]["generation"] = {"hypotheses": [h.to_dict() for h in new_hypotheses]}
 
-        # Ensure context.active_hypotheses reflects the final ranked hypotheses for meta-review
-        # Use all hypotheses from the final ranking step (not just active_hypos, which may be filtered)
+        active_hypos = context.get_active_hypotheses()
+
+        # 2. Reflection (hypotheses with a successful prior review keep it)
+        logger.info("Step 2: Reflection")
+        unreviewed = [h for h in active_hypos if not _has_review(h)]
+        with usage_step("reflection"):
+            errors += self.reflection_agent.review_hypotheses(unreviewed, context, research_goal)
+        cycle_details["steps"]["reflection"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
+
+        # 3. Ranking (single tournament over evolved + new + surviving hypotheses)
+        logger.info("Step 3: Ranking")
+        with usage_step("tournament"):
+            errors += self.ranking_agent.run_tournament(active_hypos, context, research_goal)
+        for h in active_hypos:
+            h.elo_history.append([cycle_details["iteration"], round(h.elo_score, 1)])
+        cycle_details["steps"]["ranking"] = {"hypotheses": [h.to_dict() for h in active_hypos]}
+
         final_ranked_hypos = [h for h in active_hypos]
         context.active_hypotheses = {h.hypothesis_id: h for h in final_ranked_hypos}
 
-        # 6. Proximity Analysis
-        logger.info("Step 6: Proximity Analysis")
-        proximity_result = self.proximity_agent.build_proximity_graph(context)  # Pass context
+        # 4. Meta-review (steers the next cycle's evolution)
+        logger.info("Step 4: Meta-Review")
+        with usage_step("meta_review"):
+            overview = self.meta_review_agent.summarize_and_feedback(
+                context, adjacency=None, research_goal=research_goal
+            )
+        cycle_details["meta_review"] = overview
+        cycle_details["steps"]["meta_review"] = overview
+        if overview.get("fallback_reason"):
+            errors.append(
+                "Meta-review failed; next cycle's evolution will use a rule-based summary instead: "
+                f"{overview['fallback_reason']}"
+            )
+
+        # 5. Proximity Analysis
+        logger.info("Step 5: Proximity Analysis")
+        proximity_result = self.proximity_agent.build_proximity_graph(context)
         cycle_details["steps"]["proximity"] = {
             "adjacency_graph": proximity_result["adjacency_graph"],
             "nodes": proximity_result["nodes"],
             "edges": proximity_result["edges"],
         }
 
-        # 7. Meta-review
-        logger.info("Step 7: Meta-Review")
-        overview = self.meta_review_agent.summarize_and_feedback(context, proximity_result["adjacency_graph"])
-        cycle_details["meta_review"] = overview
-        # Add meta-review to steps for consistency
-        cycle_details["steps"]["meta_review"] = overview
+        if errors:
+            cycle_details["errors"] = errors
 
-        # Increment iteration number at the end of the cycle
         context.iteration_number += 1
         logger.info("--- Cycle %d Complete ---", context.iteration_number)
         return cycle_details

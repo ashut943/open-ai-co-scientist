@@ -7,7 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Token counting: each cycle records input, output, and reasoning tokens per
+  step (generation, evolution, reflection, tournament, meta-review). The status
+  box shows totals for the cycle and the session, plus a cost estimate for
+  models listed under `token_prices_per_million` in `config.yaml`; the report
+  has a Token Usage table.
+- Charts in the results panel and the saved HTML report: Elo rating across
+  cycles, a hypothesis family tree (parents → evolved children, colored by
+  operator), a review-score heatmap, and a similarity graph. They are inline SVG,
+  so no plotting dependency is needed. Hypotheses now record `elo_history`.
+- Reflection reviews are now grounded in a literature search per hypothesis
+  (default sources: OpenAlex + arXiv; Semantic Scholar and PubMed are opt-in
+  via `literature_search.sources`). Retrieved papers are shown to the reviewer
+  as `[P#]`, novelty must be judged against them, and each hypothesis records
+  its `closest_prior_work` and the papers it was checked against. Cited
+  references are kept only when they map to a retrieved or user-provided paper
+  or to a DOI that Crossref confirms exists; others are dropped and counted.
+  Search failures (timeouts, rate limits) appear in the error box.
+- A "References and notes" box under the research goal. Each line may be a DOI,
+  an arXiv ID/URL, a PubMed ID/URL, or a free-text note. Identifiers are resolved
+  once per goal (Crossref / arXiv / PubMed) and given to generation,
+  reflection and evolution prompts as `[U#]`. The References tab lists your
+  references, the literature each review used, and related papers for the goal.
+- Optional environment variables: `LITERATURE_CONTACT_EMAIL`,
+  `OPENALEX_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `NCBI_API_KEY`;
+  `CO_SCIENTIST_DISABLE_LITERATURE=1` turns all lookups off.
+- Each run report is also saved as a PDF next to the HTML
+  (`results/reports/<run-id>.pdf`), printed with headless Chromium via
+  Playwright; skipped with a log line if Playwright/Chromium is missing, or
+  when `CO_SCIENTIST_DISABLE_PDF=1`. The history table links both.
+  LaTeX in hypotheses and reviews (`$...$`, `$$...$$`, `\(...\)`, `\[...\]`)
+  is typeset with KaTeX (loaded from a CDN; raw TeX stays if offline), and
+  the PDF is printed after the math has rendered. The app's results panel
+  typesets LaTeX the same way each time it updates.
+- Literature search retrieves 5 papers per source (was 3), up to 8 per
+  review prompt.
+
+### Fixed
+- LLM calls send an output cap (`llm_max_output_tokens`, default 32000) as
+  `max_completion_tokens`. Without it the gateway's default (~4k for Claude
+  models) cut off Opus generations mid-JSON. Output stopped at the limit is now
+  reported as "cut off at the output token limit" instead of a JSON parse error.
+- Token counting reads Anthropic-style `input_tokens`/`output_tokens` and adds
+  `prompt_tokens_details.cached_tokens` when the gateway under-reports
+  `prompt_tokens` (Parley + Opus showed 4 input tokens per call).
+- The "Related papers for the research goal" search no longer sends the whole
+  goal text (OpenAlex answered 400 Bad Request). It searches the key phrases of
+  the top-ranked hypotheses, or the goal's first sentence when there are none.
+- `call_llm` no longer sends `temperature`, which reasoning models such as
+  `gpt-5-mini` reject unless it is 1. The UI temperature sliders were removed.
+- The UI was restyled (header card, side panel, examples next to the goal), and
+  result cards now use translucent colors that stay readable in dark mode.
+- arXiv searches require all significant query words (retrying with fewer
+  when nothing matches), and a preprint is merged with its journal version even
+  when their DOIs differ.
+- Literature searches use `search_keywords` that the generation/evolution
+  LLM returns with each hypothesis: 2-4 key phrases (field-standard terms, no
+  coined names), falling back to the title; title-word queries pulled in
+  off-topic papers. arXiv matches each phrase exactly, dropping the
+  least important phrases (down to two) when nothing matches.
+- LLM JSON with LaTeX written using single backslashes (`"$\sigma$"`, an
+  invalid JSON escape) is repaired and parsed instead of failing the step;
+  raw newlines or tabs inside JSON strings are accepted too.
+- The reviewer lists which retrieved papers are actually relevant
+  (`relevant_papers`); only those are recorded as the literature the
+  hypothesis was checked against ("N relevant of M retrieved").
+- User references without a Crossref abstract get one from OpenAlex by DOI.
+- User notes are no longer listed as a hypothesis's cited references (they
+  still go into every prompt). Logs no longer print an unused temperature.
+- Clicking "Set Research Goal" again with the same goal and references no
+  longer wipes the session, so later cycles (and evolution) actually run.
+
 ### Changed
+- Reflection reviews (with their literature searches) and tournament judge
+  calls now run concurrently, up to `llm_max_concurrency` (default 4) at a
+  time. Elo is still updated in pair order after judging, so rankings follow
+  the same rules; arXiv searches still queue on one rate-limited client.
+- Failures after generation are no longer silent. If a reflection review,
+  tournament judgment, meta-review, or evolution operator fails, the cause is
+  added to `cycle_details["errors"]` and shown in the results error box and
+  status line, while the cycle continues with its fallback. A failed review
+  no longer invents MEDIUM ratings or overwrites an earlier successful review,
+  and the meta-review section is marked when it is a rule-based fallback.
+- Tournaments no longer judge every pair: each hypothesis plays about
+  `tournament_matches_per_hypothesis` (default 3) LLM-judged matches, so judge
+  calls grow linearly instead of as n*(n-1)/2 (set 0 for a full round-robin).
+  Hypotheses that already have a successful reflection review are not
+  re-reviewed in later cycles.
+- Meta-review is now an LLM analysis (recurring strengths/weaknesses,
+  unexplored mechanisms, shared assumptions, contradictions, promising pairs,
+  research gaps, recommended evolution strategy) whose strategy controls which
+  operators/parents the next cycle's evolution uses. Each cycle is Generation
+  (evolved children of the previous meta-review + fresh ideas) → Reflection →
+  Tournament → Meta-review → Proximity, with a single tournament per cycle.
+  The first cycle has no evolved children.
 - Reflection now returns a peer-review schema with 1-5 scores (soundness,
   novelty, relevance, feasibility, testability, clarity, impact) plus
   strengths/weaknesses, critical assumptions, falsification conditions,

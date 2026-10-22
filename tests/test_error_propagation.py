@@ -2,6 +2,7 @@
 ranking (issue llnl#36). Offline: the LLM boundary is mocked at app.agents.call_llm.
 """
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 import app.utils as utils
 from app.agents import GenerationAgent, SupervisorAgent
 from app.models import ContextMemory, ResearchGoal
+from app.plots import cycle_plots_html
 from app.utils import classify_llm_error
 
 # --- classifier unit tests (the four required categories + fallback) ---
@@ -88,13 +90,83 @@ def test_run_cycle_propagates_generation_error(llm_error, expected_category):
     assert expected_category in {classify_llm_error(e) for e in details["errors"]}
 
 
-def test_run_cycle_no_errors_key_on_success():
-    payload = '[{"title": "H1", "text": "idea one"}]'
-    with patch("app.agents.call_llm", return_value=payload):
-        details = SupervisorAgent().run_cycle(_goal(), ContextMemory())
+_REVIEW = json.dumps({"review_scores": {"novelty": 4, "feasibility": 3}, "comment": "ok", "references": []})
+_JUDGMENT = json.dumps({"winner": "A", "confidence": 0.8, "reasoning": "A", "criterion_scores": {}})
+_META = json.dumps({"recommended_evolution_strategy": [{"operator": "REFINE", "parent_ids": []}]})
+_CHILD = json.dumps({"title": "Child", "text": "evolved", "reasoning": "r"})
+_GENERATED = '[{"title": "H1", "text": "idea one"}, {"title": "H2", "text": "idea two"}]'
 
-    assert "errors" not in details or not details["errors"]
-    assert details["steps"]["generation"]["hypotheses"]
+
+def _step_llm(**failing):
+    """Fake LLM answering each step by its prompt; `failing` maps a step name
+    (reflection/judge/meta/evolution) to the error string that step returns."""
+
+    def fake(prompt, temperature=0.7, model=None):
+        if "Score the hypothesis" in prompt:
+            return failing.get("reflection", _REVIEW)
+        if "tournament judge" in prompt:
+            return failing.get("judge", _JUDGMENT)
+        if "conducting a meta-review" in prompt:
+            return failing.get("meta", _META)
+        if "Evolution operator:" in prompt:
+            return failing.get("evolution", _CHILD)
+        return _GENERATED
+
+    return fake
+
+
+def _run_two_cycles(fake_llm):
+    """Evolution only runs from cycle 2 (it follows the previous meta-review)."""
+    supervisor, context = SupervisorAgent(), ContextMemory()
+    with (
+        patch("app.agents.call_llm", side_effect=fake_llm),
+        patch(
+            "app.agents.ProximityAgent.build_proximity_graph",
+            return_value={"adjacency_graph": {}, "nodes": [], "edges": []},
+        ),
+    ):
+        return [supervisor.run_cycle(_goal(), context) for _ in range(2)]
+
+
+def test_run_cycle_no_errors_key_on_success():
+    for details in _run_two_cycles(_step_llm()):
+        assert "errors" not in details or not details["errors"]
+        assert details["steps"]["generation"]["hypotheses"]
+
+
+def test_two_cycles_record_elo_history_and_feed_the_charts():
+    first, second = _run_two_cycles(_step_llm())
+
+    pool = second["steps"]["ranking"]["hypotheses"]
+    survivors = [h for h in pool if len(h["elo_history"]) == 2]
+    assert survivors and [c for c, _ in survivors[0]["elo_history"]] == [1, 2]
+    assert any(h["parent_ids"] for h in pool)
+    charts = cycle_plots_html(second)
+    assert "Elo rating across cycles" in charts
+    assert "Hypothesis family tree" in charts
+    assert "Hypothesis family tree" not in cycle_plots_html(first)
+
+
+@pytest.mark.parametrize(
+    "step, marker",
+    [
+        ("reflection", "Reflection review failed"),
+        ("judge", "Tournament judge failed"),
+        ("meta", "Meta-review failed"),
+        ("evolution", "evolution of"),
+    ],
+)
+def test_run_cycle_surfaces_failures_after_generation(step, marker):
+    """A failing later step must reach cycle_details["errors"] even though the
+    cycle keeps going with a fallback, so the UI cannot report plain success."""
+    llm_error = "Error: Rate limit exceeded: too many requests"
+    cycles = _run_two_cycles(_step_llm(**{step: llm_error}))
+
+    assert all(d["steps"]["generation"]["hypotheses"] for d in cycles)
+    all_errors = [e for d in cycles for e in d.get("errors", [])]
+    matching = [e for e in all_errors if marker in e]
+    assert matching, f"{step} failure was not surfaced: {all_errors}"
+    assert classify_llm_error(matching[0]) == "Rate limited by the model provider"
 
 
 def test_surfaced_error_never_contains_key(monkeypatch):

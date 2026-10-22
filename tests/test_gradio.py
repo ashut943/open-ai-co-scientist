@@ -216,3 +216,28 @@ def test_run_cycle_with_progress_times_out(gradio_app_module, monkeypatch, tmp_p
     assert gradio_app_module.global_context.iteration_number == 0
     time.sleep(0.06)
     assert len(list((tmp_path / "runs").glob("*.json"))) == 1
+
+
+def test_set_research_goal_continues_same_goal_and_resets_on_change(gradio_app_module, monkeypatch):
+    module = gradio_app_module
+    monkeypatch.setattr(module, "current_research_goal", None)
+    monkeypatch.setattr(module, "global_context", module.ContextMemory())
+
+    module.set_research_goal("Goal A", user_references_text="10.1000/x\n\n  pilot note ")
+    first_context = module.global_context
+    first_context.iteration_number = 1
+    module.current_research_goal.resolved_references = [{"label": "U1", "kind": "note", "text": "x"}]
+
+    status, _ = module.set_research_goal(
+        "Goal A", reflection_temperature=0.2, user_references_text="10.1000/x\npilot note"
+    )
+    assert module.global_context is first_context
+    assert "Continuing this goal: cycle 2" in status
+    assert "References provided:** 2" in status
+    assert module.current_research_goal.reflection_temperature == 0.2
+    assert module.current_research_goal.resolved_references == [{"label": "U1", "kind": "note", "text": "x"}]
+
+    status, _ = module.set_research_goal("Goal A", user_references_text="10.1000/y")
+    assert module.global_context is not first_context
+    assert "starting at cycle 1" in status
+    assert module.current_research_goal.resolved_references is None

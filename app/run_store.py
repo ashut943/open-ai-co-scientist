@@ -12,10 +12,29 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
-from .utils import redact_secrets
+from .plots import cycle_plots_html
+from .utils import logger, redact_secrets
 
 DEFAULT_RESULTS_DIR = Path("results")
 RUNS_DIR_ENV = "CO_SCIENTIST_RUNS_DIR"
+DISABLE_PDF_ENV = "CO_SCIENTIST_DISABLE_PDF"
+
+KATEX_URL = "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist"
+# Renders the LaTeX that models write in hypotheses and reviews; without network the raw
+# TeX stays readable. data-math-ready tells the PDF printer rendering has finished.
+KATEX_OPTIONS_JS = (
+    "{delimiters:["
+    "{left:'$$',right:'$$',display:true},{left:'\\\\[',right:'\\\\]',display:true},"
+    "{left:'$',right:'$',display:false},{left:'\\\\(',right:'\\\\)',display:false}],"
+    "throwOnError:false,ignoredTags:['script','noscript','style','textarea','pre','code']}"
+)
+KATEX_HEAD = (
+    f'<link rel="stylesheet" href="{KATEX_URL}/katex.min.css">'
+    f'<script defer src="{KATEX_URL}/katex.min.js"></script>'
+    f'<script defer src="{KATEX_URL}/contrib/auto-render.min.js" onload="'
+    f"renderMathInElement(document.body,{KATEX_OPTIONS_JS});"
+    "document.body.dataset.mathReady='1'\"></script>"
+)
 
 SECRET_PATTERNS = [
     re.compile(r"sk-or-v1-[A-Za-z0-9_-]+"),
@@ -81,6 +100,7 @@ def research_goal_to_dict(research_goal: Any) -> Dict[str, Any]:
             "reflection_temperature": getattr(research_goal, "reflection_temperature", None),
             "elo_k_factor": getattr(research_goal, "elo_k_factor", None),
             "top_k_hypotheses": getattr(research_goal, "top_k_hypotheses", None),
+            "user_references": getattr(research_goal, "user_references", []),
         }
     )
 
@@ -142,6 +162,7 @@ def delete_run(run_id: str) -> bool:
     run_path.unlink()
     report_path = get_reports_dir() / f"{safe_run_id}.html"
     report_path.unlink(missing_ok=True)
+    report_path.with_suffix(".pdf").unlink(missing_ok=True)
     return True
 
 
@@ -175,6 +196,27 @@ def list_runs(limit: Optional[int] = 20) -> List[Dict[str, Any]]:
     return sorted_runs[:limit]
 
 
+def _token_usage_table(usage: Optional[Dict[str, Any]]) -> str:
+    if not usage or not usage.get("steps"):
+        return ""
+    rows = list(usage["steps"].items()) + [("This cycle", usage.get("total") or {})]
+    if usage.get("session_total"):
+        rows.append(("Session so far", usage["session_total"]))
+    body = "".join(
+        f"<tr><td>{_escape(name)}</td>"
+        + "".join(f"<td>{int(counts.get(field, 0)):,}</td>" for field in _USAGE_FIELDS)
+        + "</tr>"
+        for name, counts in rows
+    )
+    return (
+        "<table><tr><th>Step</th><th>Calls</th><th>Input tokens</th><th>Output tokens</th>"
+        f"<th>Reasoning tokens</th></tr>{body}</table>"
+    )
+
+
+_USAGE_FIELDS = ("calls", "input_tokens", "output_tokens", "reasoning_tokens")
+
+
 def render_report(run: Dict[str, Any]) -> str:
     goal = run.get("research_goal", {})
     cycle = run.get("cycle_details", {})
@@ -195,7 +237,10 @@ def render_report(run: Dict[str, Any]) -> str:
         ".meta{color:#52606d}.hypothesis{border-left:4px solid #2f80ed;padding-left:12px;margin:14px 0}",
         "pre{white-space:pre-wrap;background:#f5f7fa;padding:12px;border-radius:6px;overflow:auto}",
         "table{border-collapse:collapse;width:100%}td,th{border:1px solid #d9e2ec;padding:8px;text-align:left}",
+        "svg{max-width:100%;height:auto}",
+        "@media print{body{margin:0}.hypothesis,svg,tr{break-inside:avoid}h2,h3{break-after:avoid}}",
         "</style>",
+        KATEX_HEAD,
         "</head>",
         "<body><main>",
         f"<h1>Research Run {_escape(run.get('run_id'))}</h1>",
@@ -213,6 +258,14 @@ def render_report(run: Dict[str, Any]) -> str:
             html_parts.append(_hypothesis_block(index, hypothesis))
     else:
         html_parts.append("<p>No final hypotheses were available for this run.</p>")
+
+    charts = cycle_plots_html(cycle)
+    if charts:
+        html_parts.append(f"</section><section><h2>Charts</h2>{charts}")
+
+    usage_table = _token_usage_table(cycle.get("token_usage"))
+    if usage_table:
+        html_parts.append(f"</section><section><h2>Token Usage</h2>{usage_table}")
 
     html_parts.append("</section><section><h2>Cycle Steps</h2>")
     for step_name, step_data in steps.items():
@@ -234,15 +287,64 @@ def render_report(run: Dict[str, Any]) -> str:
     return "\n".join(html_parts)
 
 
-def write_report(run: Dict[str, Any]) -> Path:
+def write_report(run: Dict[str, Any], pdf: bool = True) -> Path:
+    """Write the HTML report and, when `pdf`, a PDF copy next to it (same name, .pdf)."""
     get_reports_dir().mkdir(parents=True, exist_ok=True)
     report_path = get_reports_dir() / f"{Path(run['run_id']).name}.html"
     report_path.write_text(render_report(run), encoding="utf-8")
+    if pdf:
+        write_pdf_report(report_path)
     return report_path
 
 
+def write_pdf_report(report_path: Path) -> Optional[Path]:
+    """Print an HTML report to PDF with headless Chromium (Playwright).
+
+    Best-effort: returns None when disabled, when Playwright or its Chromium
+    is not installed (`pip install playwright && playwright install chromium`),
+    or when printing fails; the HTML report is unaffected.
+    """
+    if os.getenv(DISABLE_PDF_ENV):
+        return None
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.info("Skipping PDF report: playwright is not installed.")
+        return None
+    pdf_path = Path(report_path).with_suffix(".pdf")
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            try:
+                page = browser.new_page()
+                page.goto(Path(report_path).resolve().as_uri())
+                try:
+                    page.wait_for_function("document.body.dataset.mathReady === '1'", timeout=15000)
+                    page.evaluate("document.fonts.ready.then(() => true)")
+                except Exception as e:
+                    logger.info("PDF report printed without rendered math: %s", redact_secrets(str(e)))
+                page.pdf(
+                    path=str(pdf_path),
+                    format="A4",
+                    print_background=True,
+                    margin={"top": "16mm", "bottom": "16mm", "left": "14mm", "right": "14mm"},
+                )
+            finally:
+                browser.close()
+    except Exception as e:
+        logger.warning("Could not write PDF report %s: %s", pdf_path.name, redact_secrets(str(e)))
+        return None
+    return pdf_path
+
+
+def pdf_report_path(report_path: Path | str) -> Optional[Path]:
+    """The PDF written next to an HTML report, if one exists."""
+    pdf_path = Path(report_path).with_suffix(".pdf")
+    return pdf_path if pdf_path.exists() else None
+
+
 def ensure_report(run_id: str) -> Path:
-    return write_report(load_run(run_id))
+    return write_report(load_run(run_id), pdf=False)
 
 
 def history_html(limit: int = 20) -> str:
@@ -255,15 +357,17 @@ def history_html(limit: int = 20) -> str:
         try:
             report_path = ensure_report(run["run_id"])
             report_link = report_file_url(report_path)
+            pdf_path = pdf_report_path(report_path)
         except OSError:
-            report_link = "#"
+            report_link, pdf_path = "#", None
+        pdf_link = f' · <a href="{_escape(report_file_url(pdf_path))}" target="_blank">PDF</a>' if pdf_path else ""
         rows.append(
             "<tr>"
             f"<td>{_escape(run.get('created_at'))}</td>"
             f"<td>{_escape(run.get('goal'))}</td>"
             f"<td>{_escape(run.get('iteration'))}</td>"
             f"<td><code>{_escape(run.get('run_id'))}</code></td>"
-            f'<td><a href="{_escape(report_link)}" target="_blank">Open report</a></td>'
+            f'<td><a href="{_escape(report_link)}" target="_blank">Open report</a>{pdf_link}</td>'
             "</tr>"
         )
 
@@ -277,8 +381,6 @@ def _settings_table(goal: Dict[str, Any]) -> str:
     fields = [
         "llm_model",
         "num_hypotheses",
-        "generation_temperature",
-        "reflection_temperature",
         "elo_k_factor",
         "top_k_hypotheses",
     ]
@@ -310,6 +412,8 @@ def _hypothesis_block(index: int, hypothesis: Dict[str, Any]) -> str:
         ("Falsification conditions", "falsification_conditions"),
         ("Safety / ethics", "safety_ethical_concerns"),
         ("Recommended improvements", "recommended_improvements"),
+        ("Closest prior work", "closest_prior_work"),
+        ("References", "references"),
     ):
         values = hypothesis.get(key) or []
         if values:
@@ -320,7 +424,7 @@ def _hypothesis_block(index: int, hypothesis: Dict[str, Any]) -> str:
         '<div class="hypothesis">'
         f"<h3>{index}. {_escape(hypothesis.get('title'), 'Untitled')}</h3>"
         f"<p><strong>ID:</strong> {_escape(hypothesis.get('id'))} | "
-        f"<strong>Elo:</strong> {_escape(hypothesis.get('elo_score'))}</p>"
+        f"<strong>Elo:</strong> {_escape(_round(hypothesis.get('elo_score')))}</p>"
         f"<p>{_escape(hypothesis.get('text'))}</p>"
         f"<p><strong>Novelty:</strong> {_escape(hypothesis.get('novelty_review'))} | "
         f"<strong>Feasibility:</strong> {_escape(hypothesis.get('feasibility_review'))}</p>"
@@ -329,6 +433,10 @@ def _hypothesis_block(index: int, hypothesis: Dict[str, Any]) -> str:
         f"<ul>{comments_html}</ul>"
         "</div>"
     )
+
+
+def _round(value: Any) -> Any:
+    return round(value, 1) if isinstance(value, float) else value
 
 
 def _escape(value: Any, default: str = "") -> str:

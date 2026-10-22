@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 from app.agents import ReflectionAgent, call_llm_for_reflection
 from app.models import REVIEW_SCORE_KEYS, ContextMemory, Hypothesis, ResearchGoal
+from app.tools import literature as lit
+from app.utils import classify_llm_error
 
 
 def _rich_payload(**overrides):
@@ -54,6 +56,28 @@ def test_reflection_parses_rich_schema_and_derives_ordinals():
     assert mock_call.call_args.kwargs["model"] == "gpt-5-mini"
 
 
+def test_reflection_tolerates_single_backslash_latex():
+    payload = _rich_payload(review_weaknesses=["BOUND"]).replace(
+        '"BOUND"', r'"Bound $2/\dot{\sigma}_X$ uses \frac and \nabla; ok \\alpha\n next"'
+    )
+
+    with patch("app.agents.call_llm", return_value=payload):
+        review = call_llm_for_reflection("Hypothesis", model="m", research_goal="Goal")
+
+    assert review["error"] is None
+    assert review["review_weaknesses"] == ["Bound $2/\\dot{\\sigma}_X$ uses \\frac and \\nabla; ok \\alpha\n next"]
+
+
+def test_reflection_tolerates_raw_newlines_inside_strings():
+    payload = _rich_payload(review_weaknesses=["WEAK"]).replace('"WEAK"', '"Line one\nline two\twith a tab"')
+
+    with patch("app.agents.call_llm", return_value=payload):
+        review = call_llm_for_reflection("Hypothesis", model="m", research_goal="Goal")
+
+    assert review["error"] is None
+    assert review["review_weaknesses"] == ["Line one\nline two\twith a tab"]
+
+
 def test_reflection_handles_fenced_json():
     payload = "```json\n" + _rich_payload() + "\n```"
     with patch("app.agents.call_llm", return_value=payload):
@@ -90,6 +114,37 @@ def test_reflection_error_returns_not_reviewed_rich_defaults():
     assert review["review_scores"] == {k: 0 for k in REVIEW_SCORE_KEYS}
     assert review["critical_assumptions"] == []
     assert review["references"] == []
+    assert review["error"] == "Error: API call failed"
+
+
+def test_reflection_unparsable_output_is_an_error_not_medium():
+    with patch("app.agents.call_llm", return_value="I think it's pretty good."):
+        review = call_llm_for_reflection("hypothesis text")
+
+    assert review["error"].startswith("Could not parse LLM response")
+    assert review["novelty_review"] == "Not reviewed"
+    assert review["review_scores"] == {k: 0 for k in REVIEW_SCORE_KEYS}
+
+
+def test_reflection_agent_reports_failure_and_keeps_prior_review():
+    goal = ResearchGoal(description="Goal")
+    context = ContextMemory()
+    reviewed = Hypothesis("G1", "Reviewed", "body one")
+    reviewed.review_scores = {"novelty": 4}
+    reviewed.novelty_review = "HIGH"
+    fresh = Hypothesis("G2", "Fresh", "body two")
+    context.add_hypothesis(reviewed)
+    context.add_hypothesis(fresh)
+
+    with patch("app.agents.call_llm", return_value="Error: Rate limit exceeded: slow down"):
+        errors = ReflectionAgent().review_hypotheses([reviewed, fresh], context, goal)
+
+    assert len(errors) == 1
+    assert "G1" in errors[0] and "G2" in errors[0]
+    assert "Rate limit exceeded" in errors[0]
+    assert reviewed.review_scores == {"novelty": 4}
+    assert reviewed.novelty_review == "HIGH"
+    assert fresh.novelty_review == "Not reviewed"
 
 
 def test_reflection_agent_populates_hypothesis_fields():
@@ -99,8 +154,9 @@ def test_reflection_agent_populates_hypothesis_fields():
     context.add_hypothesis(hypo)
 
     with patch("app.agents.call_llm", return_value=_rich_payload()):
-        ReflectionAgent().review_hypotheses([hypo], context, goal)
+        errors = ReflectionAgent().review_hypotheses([hypo], context, goal)
 
+    assert errors == []
     assert hypo.novelty_review == "HIGH"
     assert hypo.feasibility_review == "LOW"
     assert hypo.review_scores["scientific_soundness"] == 4
@@ -108,5 +164,116 @@ def test_reflection_agent_populates_hypothesis_fields():
     assert hypo.falsification_conditions
     assert hypo.safety_ethical_concerns == ["Lead-containing precursors"]
     assert hypo.recommended_improvements == ["Specify encapsulation strategy"]
-    assert hypo.references == ["2301.12345"]
+    # No literature was retrieved, so the bare arXiv ID cannot be verified.
+    assert hypo.references == []
+    assert any("Dropped 1 cited reference" in c for c in hypo.review_comments)
     assert any("Promising but feasibility" in c for c in hypo.review_comments)
+
+
+class _FakeLiterature:
+    def __init__(self, papers, errors=()):
+        self.papers, self.errors, self.queries = papers, list(errors), []
+
+    def search(self, query):
+        self.queries.append(query)
+        return list(self.papers), list(self.errors)
+
+
+def test_reflection_prompt_includes_literature_and_user_references():
+    paper = lit._paper("openalex", "W1", "Perovskite tandems at scale", "We demonstrate tandems.", 2023)
+    user_refs = [{"label": "U1", "kind": "note", "text": "Pilot showed a 3% gain", "raw": "x"}]
+
+    with patch("app.agents.call_llm", return_value=_rich_payload()) as mock_call:
+        call_llm_for_reflection("hypothesis text", literature=[paper], user_references=user_refs)
+
+    prompt = mock_call.call_args.args[0]
+    assert "[P1]" in prompt and "Perovskite tandems at scale" in prompt
+    assert "[U1] Note from the user: Pilot showed a 3% gain" in prompt
+    assert "closest_prior_work" in prompt
+    assert "relevant_papers" in prompt
+
+
+def test_reflection_agent_keeps_only_papers_the_reviewer_judged_relevant():
+    goal = ResearchGoal(description="Goal")
+    context = ContextMemory()
+    hypo = Hypothesis("G1", "Activity bounds under feedback", "body")
+    context.add_hypothesis(hypo)
+    on_topic = lit._paper("openalex", "W1", "Dynamical activity bounds precision", doi="10.1000/act")
+    off_topic = lit._paper("arxiv", "2301.1", "PressureTransferNet: ground pressure from video")
+    searcher = _FakeLiterature([off_topic, on_topic])
+
+    with patch("app.agents.call_llm", return_value=_rich_payload(relevant_papers=["P2"], references=["P2"])):
+        ReflectionAgent(literature=searcher).review_hypotheses([hypo], context, goal)
+
+    assert [p["title"] for p in hypo.literature] == ["Dynamical activity bounds precision"]
+    assert hypo.literature_retrieved == 2
+    assert hypo.references == [lit.citation(on_topic)]
+
+
+def test_reflection_agent_keeps_all_papers_when_reviewer_omits_relevance():
+    goal = ResearchGoal(description="Goal")
+    context = ContextMemory()
+    hypo = Hypothesis("G1", "Activity bounds under feedback", "body")
+    context.add_hypothesis(hypo)
+    papers = [lit._paper("openalex", "W1", "A"), lit._paper("openalex", "W2", "B")]
+
+    with patch("app.agents.call_llm", return_value=_rich_payload()):
+        ReflectionAgent(literature=_FakeLiterature(papers)).review_hypotheses([hypo], context, goal)
+
+    assert len(hypo.literature) == 2
+
+
+def test_reflection_agent_grounds_review_in_literature_and_user_references():
+    goal = ResearchGoal(description="Real research goal")
+    goal.resolved_references = [{"label": "U1", "kind": "note", "text": "Pilot showed a 3% gain", "raw": "x"}]
+    context = ContextMemory()
+    hypo = Hypothesis("G1", "Perovskite silicon tandem stability", "Hypothesis body")
+    context.add_hypothesis(hypo)
+    paper = lit._paper(
+        "openalex", "W1", "Perovskite tandems at scale", "Abstract.", 2023, "Nature", ["A. Smith"], "10.1000/tandem"
+    )
+    searcher = _FakeLiterature([paper])
+    payload = _rich_payload(
+        references=["P1", "U1", "Invented et al. (2020)"],
+        closest_prior_work=["P1: same tandem architecture"],
+    )
+
+    with patch("app.agents.call_llm", return_value=payload):
+        errors = ReflectionAgent(literature=searcher).review_hypotheses([hypo], context, goal)
+
+    assert errors == []
+    assert searcher.queries == ["Perovskite silicon tandem stability"]
+    assert hypo.closest_prior_work == ["P1: same tandem architecture"]
+    assert hypo.literature[0]["doi"] == "10.1000/tandem"
+    assert hypo.references == [lit.citation(paper)]
+    assert any("Dropped 1 cited reference" in c for c in hypo.review_comments)
+
+
+def test_reflection_agent_searches_with_llm_keywords_when_present():
+    goal = ResearchGoal(description="Goal")
+    context = ContextMemory()
+    hypo = Hypothesis("G1", "Hybrid Informational-Kinetic Uncertainty Relation", "body")
+    hypo.search_keywords = "thermodynamic uncertainty relation feedback"
+    context.add_hypothesis(hypo)
+    searcher = _FakeLiterature([])
+
+    with patch("app.agents.call_llm", return_value=_rich_payload()):
+        ReflectionAgent(literature=searcher).review_hypotheses([hypo], context, goal)
+
+    assert searcher.queries == ["thermodynamic uncertainty relation feedback"]
+
+
+def test_reflection_agent_surfaces_literature_failures_once_per_cause():
+    goal = ResearchGoal(description="Goal")
+    context = ContextMemory()
+    hypos = [Hypothesis("G1", "One", "body"), Hypothesis("G2", "Two", "body")]
+    for h in hypos:
+        context.add_hypothesis(h)
+    searcher = _FakeLiterature([], errors=["Literature search (openalex) failed: boom"])
+
+    with patch("app.agents.call_llm", return_value=_rich_payload()):
+        errors = ReflectionAgent(literature=searcher).review_hypotheses(hypos, context, goal)
+
+    assert errors == ["Literature search (openalex) failed: boom (2 searches)"]
+    assert classify_llm_error(errors[0]) == "Literature search unavailable"
+    assert hypos[0].review_scores["novelty"] == 5

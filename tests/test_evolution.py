@@ -42,6 +42,10 @@ def test_call_llm_for_evolution_includes_goal_reviews_and_operator():
     )
     context.meta_review_feedback.append(
         {
+            "recurring_weaknesses": ["Some ideas lack novelty."],
+            "recommended_evolution_strategy": [
+                {"operator": "REFINE", "parent_ids": ["G1"], "rationale": "Address novelty gaps"}
+            ],
             "meta_review_critique": ["Some ideas lack novelty."],
             "research_overview": {"suggested_next_steps": ["Refine top hypotheses."]},
         }
@@ -66,6 +70,7 @@ def test_call_llm_for_evolution_includes_goal_reviews_and_operator():
     assert "Novelty: MEDIUM" in prompt
     assert "G1 is more novel." in prompt
     assert "Some ideas lack novelty." in prompt
+    assert "Latest meta-review guidance" in prompt
     assert mock_call.call_args.kwargs["model"] == "test/model"
 
 
@@ -75,16 +80,25 @@ def test_evolve_hypothesis_creates_child_with_parent_ids_without_mutating_parent
     parent = _hypo("G1", "Parent", "Original parent text.")
     original_text = parent.text
     context.add_hypothesis(parent)
-    payload = json.dumps({"title": "Child", "text": "Evolved child text.", "reasoning": "Clearer mechanism."})
+    payload = json.dumps(
+        {
+            "title": "Child",
+            "text": "Evolved child text.",
+            "reasoning": "Clearer mechanism.",
+            "search_keywords": ["perovskite tandem", "interface passivation"],
+        }
+    )
 
-    with patch("app.agents.call_llm", return_value=payload):
+    with patch("app.agents.call_llm", return_value=payload) as mock_call:
         child = evolve_hypothesis("MUTATE", [parent], goal, context)
 
+    assert "search_keywords" in mock_call.call_args.args[0]
     assert child is not None
     assert child.hypothesis_id != parent.hypothesis_id
     assert child.parent_ids == ["G1"]
     assert child.evolution_operator == "MUTATE"
     assert child.text == "Evolved child text."
+    assert child.search_keywords == '"perovskite tandem" "interface passivation"'
     assert parent.text == original_text  # no in-place mutation
     assert any("[MUTATE]" in c for c in child.review_comments)
 
@@ -116,8 +130,13 @@ def test_evolve_hypothesis_returns_none_on_llm_error():
     parent = _hypo("G1", "Parent", "Text")
     context.add_hypothesis(parent)
 
+    errors: list[str] = []
     with patch("app.agents.call_llm", return_value="Error: API call failed"):
-        assert evolve_hypothesis("SIMPLIFY", [parent], goal, context) is None
+        assert evolve_hypothesis("SIMPLIFY", [parent], goal, context, errors=errors) is None
+
+    assert len(errors) == 1
+    assert "SIMPLIFY" in errors[0] and "G1" in errors[0]
+    assert "Error: API call failed" in errors[0]
 
 
 def test_evolution_agent_runs_all_operators_and_preserves_lineage():
@@ -146,8 +165,9 @@ def test_evolution_agent_runs_all_operators_and_preserves_lineage():
         )
 
     with patch("app.agents.call_llm", side_effect=fake_llm):
-        children = EvolutionAgent().evolve_hypotheses(context, goal)
+        children, errors = EvolutionAgent().evolve_hypotheses(context, goal)
 
+    assert errors == []
     assert len(children) == 4
     ops = {c.evolution_operator for c in children}
     assert ops == {"REFINE", "MUTATE", "SIMPLIFY", "HYBRIDIZE"}
@@ -171,7 +191,7 @@ def test_evolution_agent_skips_hybridize_with_single_hypothesis():
         "app.agents.call_llm",
         return_value=json.dumps({"title": "Child", "text": "Body", "reasoning": "ok"}),
     ):
-        children = EvolutionAgent().evolve_hypotheses(context, goal)
+        children, _ = EvolutionAgent().evolve_hypotheses(context, goal)
 
     assert len(children) == 3
     assert all(c.evolution_operator != "HYBRIDIZE" for c in children)

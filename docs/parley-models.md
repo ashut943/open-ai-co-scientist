@@ -12,38 +12,112 @@ Scores are **resolution rate %** at the reported high-effort agent setting. Diff
 
 In this repo, a **cycle** is one click of **Run Cycle** in the Gradio UI: one full Open AI Co-Scientist pipeline pass for your research goal.
 
-![One Open AI Co-Scientist cycle schematic](parley-cycle-schematic.png)
+![One Open AI Co-Scientist cycle schematic](parley-cycle-schematic.png?v=2026-10-08c)
 
-With default `num_hypotheses: 4`, a cycle is roughly **1 generation + N reflections + up to 4 evolution LLM calls + reflections on evolved children + pairwise tournament judgments**. Proximity and meta-review remain mostly local.  
-“Cycles on $30” in the cost table = how many of these Run Cycle passes fit under the token-budget assumption below.
+Each cycle runs these steps in order:
+
+1. **Generation step.** From cycle 2 on, the Evolution agent first makes up to 4 LLM calls (refine / mutate / simplify on the top hypothesis, hybridize on the top two), guided by the previous cycle's meta-review. Then 1 LLM call generates fresh hypotheses.
+2. **Reflection.** 1 LLM call per hypothesis that has no review yet. Each call first runs a literature search (OpenAlex + arXiv by default). Those APIs are free, but the retrieved abstracts make the prompt larger.
+3. **Tournament.** 1 LLM judge call per match. Each hypothesis plays about `tournament_matches_per_hypothesis` (default 3) matches, so a pool of `n` hypotheses needs roughly `n × 3 / 2` judge calls. Elo updates are local.
+4. **Meta-review.** 1 LLM call over all reviews and match outcomes. Its strategy steers the next cycle's evolution.
+5. **Proximity.** Local embeddings only; no API cost.
+
+Nothing is retired, so the pool and the number of matches grow every cycle: 4 hypotheses in cycle 1, 12 in cycle 2, 20 in cycle 3.  
+“Cycles on $30” in the cost table means how many Run Cycle passes fit in $30 under the token estimate below.
+
+## Token usage estimate
+
+These are **planning estimates built from the prompt templates in `app/agents.py`, not measurements**. Defaults assumed: `num_hypotheses: 4`, `top_k_hypotheses: 2`, `tournament_matches_per_hypothesis: 3`, a ~50-token research goal, and typical model output lengths.
+
+**How tokens were counted.** One token is about 4 characters or ¾ of an English word ([OpenAI: What are tokens](https://help.openai.com/en/articles/4936856-what-are-tokens-and-how-to-count-them)). Template sizes come from character counts of each prompt in `app/agents.py`. Output sizes assume a hypothesis is ~150 words (~215 tokens with its title) and a JSON review is ~500 tokens. Every call sends one user message with no system prompt, as `call_llm` in `app/utils.py` shows.
+
+| Call | Input tokens | Visible output tokens | What drives the size |
+| --- | ---: | ---: | --- |
+| Generation | ~250 | ~900 | ~120-token template + goal + existing IDs → 4 hypotheses |
+| Reflection | ~1,800 | ~600 | ~450-token template + goal + 1 hypothesis + 6 retrieved papers × ~185 tokens (citation + 600-char abstract) → JSON review (7 scores + 7 lists) |
+| Tournament judge | ~1,300 | ~200 | template + goal + 2 × (hypothesis ~215 + formatted review ~300) → winner, reasoning, criterion scores |
+| Evolution | ~2,250 | ~300 | template + parent(s) with reviews + recent match reasoning + rendered meta-review |
+| Meta-review | 400 + 435 per hypothesis + 60 per recent match | ~700 | every hypothesis snapshot + up to 30 recent match reasons → 8 lists |
+
+| Cycle | LLM calls | Input | Visible output | Pool size |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 12 (1 gen, 4 reviews, 6 matches, 1 meta) | ~18k | ~5k | 4 new |
+| 2 | 33 (4 evo, 1 gen, 8 reviews, 19 matches, 1 meta) | ~55k | ~11k | 4 evolved + 4 new + 4 surviving |
+| 3 | 45 (4 evo, 1 gen, 8 reviews, 31 matches, 1 meta) | ~75k | ~14k | 20 |
+| **Average of 1–3** | **30** | **~49k** | **~10k** | |
+
+Tournament judging is the biggest single cost: 45% of input tokens in cycle 2 and 54% in cycle 3. Literature-grounded reflection is next, at about 26% of input in cycle 2. User references add about 100 tokens each to the generation, reflection and evolution prompts; the estimate assumes none. Per cycle it grows roughly linearly with the pool size, because of the 3-matches cap.
+
+**Hidden reasoning tokens are the biggest uncertainty.** All models in the plot are reasoning models. Their internal reasoning is billed as output even though the app never sees it ([OpenAI reasoning guide](https://platform.openai.com/docs/guides/reasoning), [Anthropic extended thinking](https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking), [Gemini thinking](https://ai.google.dev/gemini-api/docs/thinking)). `call_llm` sets no `max_tokens` or reasoning-effort limit, so the provider default applies. The plot assumes **~1,000 reasoning tokens per call**. That is an assumption for short, structured tasks at default effort, not a published figure. At 30 calls per cycle it adds ~30k output tokens.
+
+**Planning figure: ~49k input + ~40k output per cycle** (10k visible + 30k reasoning), averaged over a 3-cycle session. Before literature grounding it was ~41k + ~39k. The original figure of 80k + 32k assumed roughly 6 calls per cycle and much longer prompts.
+
+### Measured tokens (Claude Opus 5.5, Danionella goal)
+
+A real 2-cycle session on `claude-opus-5-5` (long research goal + user references, literature-grounded reviews) was billed by Parley as follows. In/out splits are backed out from list prices ($4 / $20 per 1M) and the billed USD + total tokens:
+
+| Workload | Total tokens (Parley) | ≈ Input | ≈ Output | Billed USD | Wall time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cycle 1 | 159k | ~94k | ~65k | $1.67 | ~5.5 min |
+| Cycle 2 | 523k | ~328k | ~195k | $5.21 | ~15.3 min |
+| **Cycles 1+2** | **682k** | **~422k** | **~260k** | **$6.88** | **~20.8 min** |
+
+These volumes are much larger than the planning estimate (~49k + ~40k per cycle): the measured goal and hypotheses are long, and billed output includes thinking tokens. Prefer the measured Pareto plot below for budgeting; keep the planning plot as a lower-bound / short-goal reference.
 
 ## Cost vs science scatter (co-scientist use case)
 
-Assumes one cycle uses roughly **80k input + 32k output** tokens (planning estimate; likely high vs ~6 real calls).  
-X = estimated USD / cycle. Y = Terminal-Bench-Science resolution %.  
-**★** = Pareto front (maximize science, minimize $/cycle). Only **measured** TB-Science points define the front.
+X = estimated USD at each model's list prices (log scale).  
+Y = Terminal-Bench-Science resolution %.  
+**★** = Pareto front (maximize science, minimize $). Only **measured** TB-Science points define the front.
 
-| Model | TB-Science | $ / cycle | Cycles on $30 | Pareto |
-| --- | ---: | ---: | ---: | --- |
-| `gpt-5.6-luna` | 3.3% | $0.05 | ~554 | ★ cheapest |
-| `gemini-3.8-flash` | 12.4% | $0.18 | ~166 | ★ best for ~$30 |
-| `gpt-5.6-terra` | 8.6% | $0.54 | ~55 | dominated by Flash |
-| `gpt-5.6-sol` | 22.4% | $0.96 | ~31 | dominated by Opus 5.5 |
-| `claude-opus-5-5` | 63.3% | $0.96 | ~31 | ★ best quality before Astra |
-| `claude-opus-5` | 30.0% | $1.20 | ~25 | dominated |
-| `claude-opus-4-8` | 10.5% | $1.20 | ~25 | dominated |
-| `gemini-3.7-flash` | 5.7% | $0.18 | ~166 | dominated by 3.8 Flash |
-| `gpt-6-astra` | 68.1% | $2.40 | ~12 | ★ highest science |
+### Measured Opus 5.5 tokens (cycle 1 and cycles 1+2 on one plot)
 
-### Scatter plot
+Each model is a horizontal bar: **left tick = cycle-1 cost** (~94k in + ~65k out), **right point = cycles 1+2 cost** (~422k in + ~260k out). Solid green front uses the session (1+2) dollars; dashed green front is the same models at cycle-1 dollars.
 
-![Cost vs Terminal-Bench-Science with Pareto front](parley-cost-science-pareto.png)
+| Model | TB-Science | $ / cycle 1 | $ / cycles 1+2 | Cycle-1 runs on $30 | Pareto |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `gpt-5.6-luna` | 3.3% | $0.10 | $0.40 | ~310 | ★ cheapest |
+| `gemini-3.8-flash` | 12.4% | $0.31 | $1.29 | ~95 | ★ best for ~$30 |
+| `gemini-3.7-flash` | 5.7% | $0.31 | $1.29 | ~95 | dominated by 3.8 Flash |
+| `gpt-5.6-terra` | 8.6% | $0.97 | $3.96 | ~31 | dominated by Flash |
+| `gpt-5.6-sol` | 22.4% | $1.68 | $6.89 | ~18 | dominated by Opus 5.5 |
+| `claude-opus-5-5` | 63.3% | $1.68 | $6.89 | ~18 | ★ best quality before Astra |
+| `claude-opus-5` | 30.0% | $2.09 | $8.61 | ~14 | dominated |
+| `claude-opus-4-8` | 10.5% | $2.09 | $8.61 | ~14 | dominated |
+| `gpt-6-astra` | 68.1% | $4.19 | $17.22 | ~7 | ★ highest science |
 
-Pareto polyline (left → right): **Luna → Gemini 3.8 Flash → Claude Opus 5.5 → GPT-6 Astra**.
+![Cost vs TB-Science — measured Opus cycle 1 and cycles 1+2](parley-cost-science-pareto-opus-measured.png?v=2026-10-08b)
 
-**Pick on ~$30:** stay at `gemini-3.8-flash` on the front (~166 cycles). Jump to `claude-opus-5-5` only if you need much higher measured science (~31 cycles). Skip `gpt-6-astra` until budget grows.
+Pareto polyline: **Luna → Gemini 3.8 Flash → Claude Opus 5.5 → GPT-6 Astra**.
 
-PNG path: `docs/parley-cost-science-pareto.png`. Interactive version: Cursor canvas `parley-models.canvas.tsx`.
+Opus 5.5 matches the Parley bills (~$1.67 / ~$6.88). Flash for the same tokens: ~$0.31 per cycle 1, ~$1.29 for cycles 1+2 (~23 two-cycle sessions on $30).
+
+**Pick on ~$30 (measured volumes):** stay at `gemini-3.8-flash` (~95 cycle-1 runs, or ~23 two-cycle sessions). Jump to `claude-opus-5-5` only if you need much higher measured science (~18 cycle-1 runs, or ~4 two-cycle sessions). Skip `gpt-6-astra` until budget grows.
+
+### Planning estimate (short-goal lower bound)
+
+X = estimated USD per cycle using ~49k input + ~40k output. Each grey bar extends left to the cost with zero reasoning tokens (~49k in + ~10k out). Real long-goal sessions (above) cost several times more.
+
+| Model | TB-Science | $ / cycle (no reasoning) | $ / cycle (incl. reasoning) | Cycles on $30 | Pareto |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `gpt-5.6-luna` | 3.3% | $0.022 | $0.058 | ~517 | ★ cheapest |
+| `gemini-3.8-flash` | 12.4% | $0.075 | $0.19 | ~160 | ★ best for ~$30 |
+| `gemini-3.7-flash` | 5.7% | $0.075 | $0.19 | ~160 | dominated by 3.8 Flash |
+| `gpt-5.6-terra` | 8.6% | $0.22 | $0.58 | ~52 | dominated by Flash |
+| `gpt-5.6-sol` | 22.4% | $0.40 | $1.00 | ~30 | dominated by Opus 5.5 |
+| `claude-opus-5-5` | 63.3% | $0.40 | $1.00 | ~30 | ★ best quality before Astra |
+| `claude-opus-5` | 30.0% | $0.50 | $1.25 | ~24 | dominated |
+| `claude-opus-4-8` | 10.5% | $0.50 | $1.25 | ~24 | dominated |
+| `gpt-6-astra` | 68.1% | $0.99 | $2.50 | ~12 | ★ highest science |
+
+![Cost vs Terminal-Bench-Science with Pareto front (planning estimate)](parley-cost-science-pareto.png?v=2026-10-08)
+
+All figures are generated by `scripts/make_parley_figures.py` as PNG (embedded above) and PDF (same basename in `docs/`). It also prints the numbers above. To regenerate after changing an assumption:
+
+```bash
+pip install matplotlib
+python scripts/make_parley_figures.py
+```
 
 ## Ranked chat models (your Parley IDs)
 
@@ -78,9 +152,12 @@ PNG path: `docs/parley-cost-science-pareto.png`. Interactive version: Cursor can
 
 | Priority | Model | Why |
 | --- | --- | --- |
-| **Best science / $** | `gemini-3.8-flash` | Measured 12.4% TB-Science, cheap intro rates |
-| **Best measured quality in budget** | `claude-sonnet-5-5` | No Science score yet, but top-tier TB 4.0 at $2/$10 |
-| **Avoid on $30** | `gpt-6-astra`, `claude-opus-5*`, `gpt-5.5` | High $/token; few cycles |
+| **Best science / $** | `gemini-3.8-flash` | Measured 12.4% TB-Science; ~$0.31 / cycle at Opus cycle-1 token volume (~95 cycles on $30) |
+| **Best unmeasured bet** | `claude-sonnet-5-5` | No TB-Science score yet, but top-tier TB 4.0 at $2/$10 |
+| **Repo default** | `gpt-5-mini` | `openai_model` in `config.yaml`; fine for smoke tests |
+| **Avoid on $30** | `gpt-6-astra`, `claude-opus-5*`, `gpt-5.5` | High $/token; ~18 Opus cycle-1 runs or ~4 two-cycle sessions on $30 |
+
+Budget figures above use the **measured Opus cycle-1 token volume**. The planning-estimate plot (~$0.19 Flash / cycle) is a short-goal lower bound.
 
 ## Older GPT pricing (not on TB-Science)
 
